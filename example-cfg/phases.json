@@ -1,0 +1,22 @@
+[
+  {
+    "name": "specification",
+    "goal": "Write a detailed technical specification covering all major categories of requirement: functional behaviour and correctness, performance constraints, interoperability and dependencies, security and robustness, user experience and accessibility, operations and portability, standards compliance, etc. etc. Also specify as much as necessary the intended form of the implementation in terms of key data structures, ownership and data flow; key control structures, error handling patterns and concurrent tasks/threads; any specific algorithms or edge cases; and a rough map of the module or subsystem structure."
+  },
+  {
+    "name": "interfaces",
+    "goal": "Define all public interfaces: module boundaries, function signatures with types, trait/protocol definitions, error types. No private or implementation types, just the public parts necessary to interact with a module or subsystem. Do not include function bodies. If you're writing in a language that requires function bodies, use stubs that panic or throw unimplemented errors or similar."
+  },
+  {
+    "name": "tests",
+    "goal": "Write comprehensive tests for every interface to validate conformance to the specification. Tests must exercise real logic paths, edge cases, and error conditions. Test every requirement of the spec. Do not write test stubs or TODOs, always write real tests. Never implement mocks, instead exercise the real system you're testing, calling real constructors and methods and passing real dependencies. Never write trivial/superficial tests that are guaranteed to pass, instead always aim for tests of specified functionality that would notice and fail if the functionality wasn't imlpemented correctly. Since you are writing tests before implementations exist, write only to the interfaces, and expect that all tests will fail at this stage. It is correct for them to fail before implementation. This is red/green testing and you are writing the tests first in red phase."
+  },
+  {
+    "name": "implementation",
+    "goal": "Implement all specified functionality and previously-written interfaces. Do not alter tests or interfaces, try to satisfy them as they are. Make sure to write every function, every branch, every error path. Do not leave stubs, partial implementations, TODOs, or fake implementations that return fixed values, fake values or dummy data. Instead make sure you write real logic that implements the real specified behaviour."
+  },
+  {
+    "name": "debugging",
+    "goal": "Run all tests. Fix every failure. Run any linters you have access to. Fix every warning. Ensure the project builds clean and all tests pass. You are not allowed to change interfaces or tests at this stage unless they are obviously, egregiously incorrect. Instead you should fix bugs in the implementation. This is red/green testing and you are fixing the implementation to make the tests pass in the green phase."
+  }
+]
