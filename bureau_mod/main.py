@@ -72,7 +72,9 @@ async def run(args: argparse.Namespace) -> None:
 
     problem = problem_file.read_text().strip()
     phases = [Phase(**p) for p in json.loads(phases_file.read_text())]
-    critics = [Critic(**c) for c in json.loads(critics_file.read_text())]
+    critics = [Critic(role=c["role"], prompt=c["prompt"],
+                       globs=c.get("globs"))
+                for c in json.loads(critics_file.read_text())]
     cfg = Config.load(config_file)
 
     if args.model:

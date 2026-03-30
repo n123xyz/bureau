@@ -1,16 +1,26 @@
-"""Critic/revision cycle: execute → critique → revise → judge."""
+"""Unified critique/revise cycle: critique → revise → judge.
+
+All configured critic categories are merged into a single holistic review,
+so critics can consider how issues relate to each other (e.g. a
+simplification that makes a correctness issue moot).
+
+Critic categories have optional file globs — only categories whose globs
+match at least one file touched by the work node are included.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import textwrap
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from bureau_mod.agents import run_agent, run_structured_agent
 from bureau_mod.config import Config, Critic
-from bureau_mod.git_utils import git_commit, git_get_head, git_restore_to, repo_file_listing
+from bureau_mod.git_utils import git_commit, git_get_head, git_restore_to
 from bureau_mod.state import (
     PAUSE_EVENT,
     STATE,
@@ -76,24 +86,71 @@ class CriticResult:
     edits: list[CriticEdit]
 
 
-async def run_critic_structured(
+# ═══════════════════════════════════════════════════════════════════════════
+# Merged critic
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _glob_matches(globs: list[str] | None, files: list[str]) -> bool:
+    """Return True if any glob matches any file in the list.
+
+    None or empty globs means "matches everything".
+    """
+    if not globs:
+        return True
+    for pattern in globs:
+        for f in files:
+            if fnmatch.fnmatch(f, pattern):
+                return True
+            # Also match against just the filename (not full path)
+            if fnmatch.fnmatch(PurePosixPath(f).name, pattern):
+                return True
+    return False
+
+
+def _filter_critics(critics: list[Critic], files: list[str]) -> list[Critic]:
+    """Filter critics to those whose globs match at least one written file."""
+    if not files:
+        return list(critics)  # no file info → include all
+    return [c for c in critics if _glob_matches(c.globs, files)]
+
+
+def _merge_critic_prompts(critics: list[Critic]) -> str:
+    """Merge multiple critic prompts into a single holistic review brief."""
+    if not critics:
+        return ("Review the work for completeness, correctness, "
+                "and simplicity.")
+    if len(critics) == 1:
+        return f"**{critics[0].role}**: {critics[0].prompt}"
+    parts = ["Consider all of the following aspects holistically — issues in "
+             "one area often interact with others (e.g. a simplification "
+             "might make a correctness issue moot, a completeness gap might "
+             "make other issues irrelevant).\n"]
+    for c in critics:
+        parts.append(f"**{c.role}**: {c.prompt}")
+    return "\n\n".join(parts)
+
+
+async def _run_merged_critic(
     *,
     context: str,
     task_description: str,
-    critic: Critic,
+    merged_prompt: str,
     cwd: str,
     cfg: Config,
     phase_name: str,
     label: str,
     task_id: str | None = None,
 ) -> CriticResult:
+    """Run a single unified critic with merged review categories."""
     critic_prompt = context + textwrap.dedent(f"""\
-        ## Your role: CRITIC — {critic.role}
+        ## Your role: REVIEWER
 
         Review the current state of the project files in light of the
-        task described below. Your specific review focus:
+        task described below. Your review should consider all of the
+        following aspects holistically:
 
-        {critic.prompt}
+        {merged_prompt}
 
         ### Task that was supposed to be executed
         {task_description}
@@ -106,6 +163,12 @@ async def run_critic_structured(
           improvement, "low" = cosmetic or style.
         - If everything is satisfactory, set clean=true and omit edits.
         - Do NOT fix anything. Only identify issues.
+        - Consider how issues relate to each other — a simplification might make
+          another issue moot, or a missing feature might change other priorities.
+        - If you see a `_bureau_subtasks.json` file, review the delegation plan
+          too. Are the subtasks well-scoped? Redundant? Missing something?
+          Should some be merged or split? You may list issues against that file
+          and the reviser can modify it.
         - Only review files within the working directory.
     """)
 
@@ -118,7 +181,7 @@ async def run_critic_structured(
 
     if result is None or not isinstance(result, dict):
         log.warning(f"  [{label}] critic returned unparseable output")
-        return CriticResult(role=critic.role, clean=True, edits=[])
+        return CriticResult(role="reviewer", clean=True, edits=[])
 
     clean = result.get("clean", True)
     raw_edits = result.get("edits", [])
@@ -131,14 +194,14 @@ async def run_critic_structured(
                 severity=e.get("severity", "medium"),
             ))
 
-    return CriticResult(role=critic.role, clean=clean, edits=edits)
+    return CriticResult(role="reviewer", clean=clean, edits=edits)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Revision cycle
+# Critique and revise cycle
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def revision_cycle(
+async def critique_and_revise(
     *,
     context: str,
     task_description: str,
@@ -149,63 +212,30 @@ async def revision_cycle(
     phase_name: str,
     label: str,
 ) -> None:
-    """Execute → critique → revise cycle with task state tracking."""
+    """Unified critique/revise cycle (called after work is already done).
+
+    Runs a single merged critic combining all configured review categories,
+    then revises if issues are found, with a judge to accept/reject.
+    """
 
     if task_node.status == TaskStatus.SKIPPED:
         log.info(f"  [{label}] skipped (user request)")
         return
 
-    STATE.update_task_status(task_node.id, TaskStatus.RUNNING)
-
-    # --- Step 1: Initial execution ---
-    task_node.task_type = "executor"
-    emit_event("task", task_node.to_dict())
-
-    writes = task_node.file_writes
-    reads = task_node.file_reads
-    file_constraint = ""
-    if writes:
-        wlist = ", ".join(writes)
-        file_constraint += f"\n        You MUST write these files: {wlist}"
-        file_constraint += "\n        Do NOT create or modify any other files."
-    if reads:
-        rlist = ", ".join(reads)
-        file_constraint += f"\n        You may read (but not modify): {rlist}"
-    if not writes and not reads:
-        file_constraint = ("\n        Only create or modify files within your"
-                           " working directory.")
-
-    exec_prompt = context + textwrap.dedent(f"""\
-        ## Your role: EXECUTOR
-
-        Execute the following task thoroughly and completely. Read existing
-        project files first to understand the current state. Write or modify
-        all necessary files. Do NOT skip anything — implement every detail.
-
-        ### Task
-        {task_description}
-{file_constraint}
-
-        IMPORTANT: Do not leave stubs, placeholders, or TODOs. Every piece of
-        functionality described above must be fully implemented.
-    """)
-
-    await run_agent(
-        prompt=exec_prompt, cwd=cwd, cfg=cfg, label=f"{label}/exec",
-        phase_name=phase_name, task_type="executor",
-        task_id=task_node.id,
-    )
-    git_commit(cwd, f"bureau: {label} initial execution")
-
-    # Gate check
-    listing = repo_file_listing(cwd)
-    if "(empty repository" in listing:
-        log.warning(f"  [{label}] executor produced no files — skipping critics")
-        STATE.update_task_status(task_node.id, TaskStatus.COMPLETED)
+    max_rounds = task_node.max_revision_rounds
+    if max_rounds <= 0:
         return
 
-    # --- Critique/revise rounds ---
-    max_rounds = task_node.max_revision_rounds
+    # Filter critics to those relevant to the files this node writes
+    written_files = task_node.file_writes
+    applicable = _filter_critics(critics, written_files)
+    if not applicable:
+        log.info(f"  [{label}] no applicable critics for files: "
+                 f"{written_files[:5]}")
+        return
+
+    merged_prompt = _merge_critic_prompts(applicable)
+
     for round_num in range(1, max_rounds + 1):
         # Check for skip/pause/stop-revising
         if task_node.status == TaskStatus.SKIPPED:
@@ -213,7 +243,6 @@ async def revision_cycle(
             return
         if task_node.stop_revising:
             log.info(f"  [{label}] stop-revising flag set, finishing")
-            STATE.update_task_status(task_node.id, TaskStatus.COMPLETED)
             return
         await PAUSE_EVENT.wait()
         if STATE.stopping:
@@ -226,175 +255,153 @@ async def revision_cycle(
         emit_task_output(task_node.id,
                          f"critique round {round_num}/{max_rounds}")
 
-        async def _run_one(critic: Critic) -> CriticResult:
-            # Create a child task node for this critic
-            critic_id = f"{task_node.id}-critic-{critic.role}-r{round_num}"
-            critic_node = TaskNode(
-                id=critic_id,
-                label=f"critic ({critic.role})",
-                description=f"Review focus: {critic.prompt[:200]}",
-                task_type="critic",
-                parent_id=task_node.id,
-                worktree_path=task_node.worktree_path,
-                max_revision_rounds=0,
+        # ── Single merged critic ───────────────────────────────────────
+        critic_id = f"{task_node.id}-critic-r{round_num}"
+        critic_node = TaskNode(
+            id=critic_id,
+            label=f"critic r{round_num}",
+            description=(f"Unified review: "
+                         f"{', '.join(c.role for c in applicable)}"),
+            task_type="critic",
+            parent_id=task_node.id,
+            worktree_path=task_node.worktree_path,
+            max_revision_rounds=0,
+        )
+        STATE.add_task(critic_node)
+        STATE.update_task_status(critic_id, TaskStatus.RUNNING)
+
+        try:
+            cr = await _run_merged_critic(
+                context=context,
+                task_description=task_description,
+                merged_prompt=merged_prompt,
+                cwd=cwd, cfg=cfg,
+                phase_name=phase_name,
+                label=f"{label}/critic-r{round_num}",
+                task_id=critic_id,
             )
-            STATE.add_task(critic_node)
-            STATE.update_task_status(critic_id, TaskStatus.RUNNING)
-            try:
-                result = await run_critic_structured(
-                    context=context, task_description=task_description,
-                    critic=critic, cwd=cwd, cfg=cfg,
-                    phase_name=phase_name,
-                    label=f"{label}/critic-{critic.role}-r{round_num}",
-                    task_id=critic_id,
-                )
-                STATE.update_task_status(critic_id, TaskStatus.COMPLETED)
-                return result
-            except Exception as e:
-                STATE.update_task_status(
-                    critic_id, TaskStatus.FAILED, str(e))
-                raise
+            STATE.update_task_status(critic_id, TaskStatus.COMPLETED)
+        except Exception as e:
+            STATE.update_task_status(critic_id, TaskStatus.FAILED, str(e))
+            raise
 
-        if cfg.parallel_critics and len(critics) > 1:
-            log.info(f"  [{label}] running {len(critics)} critics concurrently")
-            critic_results: list[CriticResult] = list(await asyncio.gather(
-                *(_run_one(c) for c in critics)
-            ))
-        else:
-            critic_results = [await _run_one(c) for c in critics]
-
-        any_substantive = False
-        for cr in critic_results:
-            n_high = sum(1 for e in cr.edits if e.severity == "high")
-            n_med = sum(1 for e in cr.edits if e.severity == "medium")
-            if cr.clean or not cr.edits:
-                log.info(f"  [{label}] critic {cr.role}: clean")
-            else:
-                log.info(f"  [{label}] critic {cr.role}: "
-                         f"{len(cr.edits)} edits (H={n_high} M={n_med})")
-                if n_high > 0 or n_med > 0:
-                    any_substantive = True
-
-        if not any_substantive:
-            log.info(f"  [{label}] all critics clean at round {round_num}")
-            STATE.update_task_status(task_node.id, TaskStatus.COMPLETED)
+        if cr.clean or not cr.edits:
+            log.info(f"  [{label}] critic clean at round {round_num}")
             return
 
-        # Check stop_revising again before applying edits
+        n_high = sum(1 for e in cr.edits if e.severity == "high")
+        n_med = sum(1 for e in cr.edits if e.severity == "medium")
+        log.info(f"  [{label}] critic: {len(cr.edits)} edits "
+                 f"(H={n_high} M={n_med})")
+
+        substantive = [e for e in cr.edits
+                       if e.severity in ("high", "medium")]
+        if not substantive:
+            log.info(f"  [{label}] no substantive issues at "
+                     f"round {round_num}")
+            return
+
         if task_node.stop_revising:
             log.info(f"  [{label}] stop-revising flag set, finishing")
-            STATE.update_task_status(task_node.id, TaskStatus.COMPLETED)
             return
 
-        for cr in critic_results:
-            substantive_edits = [e for e in cr.edits
-                                 if e.severity in ("high", "medium")]
-            if not substantive_edits:
-                continue
+        # ── Revise ─────────────────────────────────────────────────────
+        rev_id = f"{task_node.id}-reviser-r{round_num}"
+        rev_node = TaskNode(
+            id=rev_id,
+            label=f"reviser r{round_num}",
+            description=f"Fix {len(substantive)} issues",
+            task_type="reviser",
+            parent_id=task_node.id,
+            worktree_path=task_node.worktree_path,
+            max_revision_rounds=0,
+        )
+        STATE.add_task(rev_node)
+        STATE.update_task_status(rev_id, TaskStatus.RUNNING)
 
-            # Create a child task node for the reviser
-            rev_id = f"{task_node.id}-reviser-{cr.role}-r{round_num}"
-            rev_node = TaskNode(
-                id=rev_id,
-                label=f"reviser ({cr.role})",
-                description=(f"Fix {len(substantive_edits)} issues from "
-                             f"{cr.role} critic"),
-                task_type="reviser",
-                parent_id=task_node.id,
-                worktree_path=task_node.worktree_path,
-                max_revision_rounds=0,
-            )
-            STATE.add_task(rev_node)
-            STATE.update_task_status(rev_id, TaskStatus.RUNNING)
+        pre_commit = git_get_head(cwd)
 
-            log.info(f"  [{label}] applying {len(substantive_edits)} edits "
-                     f"from {cr.role}")
-            pre_critic_commit = git_get_head(cwd)
+        edit_list = "\n".join(
+            f"  {j+1}. [{e.severity}] {e.file}: {e.description}"
+            for j, e in enumerate(substantive)
+        )
 
-            edit_list = "\n".join(
-                f"  {j+1}. [{e.severity}] {e.file}: {e.description}"
-                for j, e in enumerate(substantive_edits)
-            )
+        revise_prompt = context + textwrap.dedent(f"""\
+            ## Your role: REVISER
 
-            revise_prompt = context + textwrap.dedent(f"""\
-                ## Your role: REVISER
+            Address ALL of the following issues found by the reviewer.
 
-                Address ALL of the following issues found by the {cr.role}
-                reviewer.
+            ### Original task
+            {task_description}
 
-                ### Original task
-                {task_description}
-
-                ### Issues to fix
+            ### Issues to fix
 {edit_list}
 
-                Instructions:
-                - Address every issue in the list above.
-                - For each issue, make the minimum change needed.
-                - Do NOT refactor unrelated code.
-                - Only modify files listed in the original task's write set.
-                  Do NOT create or modify any other files.
-            """)
+            Instructions:
+            - Address every issue in the list above.
+            - For each issue, make the minimum change needed.
+            - Do NOT refactor unrelated code.
+            - Only modify files within your working directory.
+        """)
 
-            await run_agent(
-                prompt=revise_prompt, cwd=cwd, cfg=cfg,
-                label=f"{label}/fix-{cr.role}-r{round_num}",
-                phase_name=phase_name, task_type="reviser",
-                task_id=rev_id,
-            )
-            git_commit(cwd, f"bureau: {label} {cr.role} edits r{round_num}")
-            STATE.update_task_status(rev_id, TaskStatus.COMPLETED)
+        await run_agent(
+            prompt=revise_prompt, cwd=cwd, cfg=cfg,
+            label=f"{label}/revise-r{round_num}",
+            phase_name=phase_name, task_type="reviser",
+            task_id=rev_id,
+        )
+        git_commit(cwd, f"bureau: {label} revision r{round_num}")
+        STATE.update_task_status(rev_id, TaskStatus.COMPLETED)
 
-            # Judge — also as a child task node
-            judge_id = f"{task_node.id}-judge-{cr.role}-r{round_num}"
-            judge_node = TaskNode(
-                id=judge_id,
-                label=f"judge ({cr.role})",
-                description=f"Evaluate {cr.role} revisions",
-                task_type="judge",
-                parent_id=task_node.id,
-                worktree_path=task_node.worktree_path,
-                max_revision_rounds=0,
-            )
-            STATE.add_task(judge_node)
-            STATE.update_task_status(judge_id, TaskStatus.RUNNING)
+        # ── Judge ──────────────────────────────────────────────────────
+        judge_id = f"{task_node.id}-judge-r{round_num}"
+        judge_node = TaskNode(
+            id=judge_id,
+            label=f"judge r{round_num}",
+            description="Evaluate revisions",
+            task_type="judge",
+            parent_id=task_node.id,
+            worktree_path=task_node.worktree_path,
+            max_revision_rounds=0,
+        )
+        STATE.add_task(judge_node)
+        STATE.update_task_status(judge_id, TaskStatus.RUNNING)
 
-            judge_prompt = context + textwrap.dedent(f"""\
-                ## Your role: JUDGE
+        judge_prompt = context + textwrap.dedent(f"""\
+            ## Your role: JUDGE
 
-                A batch of edits was applied for the {cr.role} reviewer.
-                Review the current state.
+            A batch of edits was applied based on review feedback.
+            Review the current state.
 
-                ### Original task
-                {task_description}
+            ### Original task
+            {task_description}
 
-                ### Edits that were applied
-            """)
-            for j, edit in enumerate(substantive_edits):
-                judge_prompt += (f"    {j+1}. [{edit.severity}] "
-                                 f"{edit.file}: {edit.description}\n")
-            judge_prompt += "\nDecide: accept (keep) or reject (revert)?"
+            ### Edits that were applied
+        """)
+        for j, edit in enumerate(substantive):
+            judge_prompt += (f"    {j+1}. [{edit.severity}] "
+                             f"{edit.file}: {edit.description}\n")
+        judge_prompt += "\nDecide: accept (keep) or reject (revert)?"
 
-            verdict = await run_structured_agent(
-                prompt=judge_prompt, schema=JUDGE_SCHEMA,
-                cwd=cwd, cfg=cfg,
-                label=f"{label}/judge-{cr.role}-r{round_num}",
-                phase_name=phase_name, task_type="judge",
-                task_id=judge_id,
-            )
+        verdict = await run_structured_agent(
+            prompt=judge_prompt, schema=JUDGE_SCHEMA,
+            cwd=cwd, cfg=cfg,
+            label=f"{label}/judge-r{round_num}",
+            phase_name=phase_name, task_type="judge",
+            task_id=judge_id,
+        )
 
-            v = "accept"
-            if isinstance(verdict, dict):
-                v = verdict.get("verdict", "accept")
-                reason = verdict.get("reason", "")
-                log.info(f"  [{label}] judge({cr.role}): {v}"
-                         f"{' — ' + reason[:80] if reason else ''}")
+        v = "accept"
+        if isinstance(verdict, dict):
+            v = verdict.get("verdict", "accept")
+            reason = verdict.get("reason", "")
+            log.info(f"  [{label}] judge: {v}"
+                     f"{' — ' + reason[:80] if reason else ''}")
 
-            STATE.update_task_status(judge_id, TaskStatus.COMPLETED)
+        STATE.update_task_status(judge_id, TaskStatus.COMPLETED)
 
-            if v == "reject" and pre_critic_commit:
-                log.info(f"  [{label}] reverting {cr.role} edits")
-                git_restore_to(cwd, pre_critic_commit)
+        if v == "reject" and pre_commit:
+            log.info(f"  [{label}] reverting revision")
+            git_restore_to(cwd, pre_commit)
 
-    log.info(f"  [{label}] revision cycle complete ({max_rounds} rounds)")
-    STATE.update_task_status(task_node.id, TaskStatus.COMPLETED)
+    log.info(f"  [{label}] critique cycle complete ({max_rounds} rounds)")

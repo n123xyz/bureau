@@ -1,14 +1,14 @@
 [
   {
     "role": "completeness",
-    "prompt": "Is the work doing an appropriately thorough job of what it is supposed to? Or does it skip steps, leave work incomplete, have dead code or unimplemented traits, gloss over details, avoid 'the hard parts'? Imagine yourself as a customer receiving this as contracted work: would you be satisfied, or would it come across as shoddy, fake, half-baked, a mere simulacrum of the intended task? If the work is code, does the code meet all functional requirements and implement all implied or specified functionality? If the work is a test, will the test detect incompleteness, do the tests cover all forms of testing we want, and would a QA engineer looking at these tests think they are sufficient to ensure complete coverage of the spec?"
+    "prompt": "Is the work doing an appropriately thorough job of what it is supposed to? Or does it skip steps, leave work incomplete, have dead code or unimplemented traits, gloss over details, avoid 'the hard parts'? Imagine yourself as a customer receiving this as contracted work: would you be satisfied, or would it come across as shoddy, fake, half-baked, a mere simulacrum of the intended task? If the work is code, does the code meet all functional requirements? If the work is a test, do the tests cover all forms of testing we want and would a QA engineer think they are sufficient?"
   },
   {
     "role": "correctness",
-    "prompt": "Are there bugs? Obvious bugs, subtle bugs, long or short distance bugs? If there is some reasonable way of defining correctness in any case, does the work meet the criteria? If the work is a test, does the test adequately check for bugs, and would the test fail if a bug was introduced in the code? If the work is code, is the code tested, or is there any way the code can ensure its correctness? If the work is a document, is there any way you can make correctness conditions more clear (without writing too much noisy text)?"
+    "prompt": "Are there bugs — obvious, subtle, long or short distance? If there is some reasonable way of defining correctness, does the work meet the criteria? If the work is code, is it tested or can it ensure its correctness? If the work is a test, does the test adequately check for bugs and would it fail if one was introduced?"
   },
   {
     "role": "simplicity",
-    "prompt": "If the work is prose: can sentences, paragraphs, or even whole sections be cut? If code: can functions, types, whole modules or other declarations be cut? Does all the work fit within the defined size limits for files, spec dirs, crates, or the work as a whole? Are some details being dealt with in the work unnecessary flourishes, irrelevant to the core of the problem? Can you get the same basic goal achieved without quite so much material? Is there pointless filler, verbosity, self-important blather, 'just in case' stuff, things that would be obvious to any reader or handled by any client, or other sorts of redundancies that previous agents might have put in 'just to make things look bigger'? If so, can you find good ways to remove them?"
+    "prompt": "If prose: can sentences, paragraphs, or whole sections be cut? If code: can functions, types, whole modules be cut? Is there pointless filler, verbosity, 'just in case' stuff, unnecessary abstractions, or redundancies that previous agents might have added? Can you get the same goal achieved with less material?"
   }
 ]

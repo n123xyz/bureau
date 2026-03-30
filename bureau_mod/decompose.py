@@ -1,8 +1,10 @@
-"""Unified hierarchical planning and execution.
+"""Unified hierarchical work decomposition.
 
-Every task goes through plan_or_execute():
-  - depth < max_depth → agent chooses plan vs execute
-  - depth >= max_depth → always executes directly
+Every task goes through work_node():
+  - Agent executes partial work within a configurable budget
+  - A unified critic reviews the work
+  - Agent optionally delegates remaining subtasks to child nodes
+  - Child nodes read parent's output as context and continue
 
 Scheduling uses separate read/write file sets:
   - Tasks whose WRITES overlap another task's WRITES or READS are serialized
@@ -12,17 +14,19 @@ Scheduling uses separate read/write file sets:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import textwrap
 import traceback
 import uuid
+from pathlib import Path
 from typing import Any
 
-from bureau_mod.agents import run_structured_agent
+from bureau_mod.agents import run_agent
 from bureau_mod.config import Config, Critic, Phase
 from bureau_mod.context import make_context
-from bureau_mod.git_utils import git_commit
-from bureau_mod.revision import revision_cycle
+from bureau_mod.git_utils import git_commit, repo_file_listing
+from bureau_mod.revision import critique_and_revise
 from bureau_mod.state import STATE, TaskNode, TaskStatus, emit_event, emit_task_output
 from bureau_mod.worktree import WorktreeManager
 
@@ -105,29 +109,11 @@ _ITEMS_SCHEMA: dict[str, Any] = {
     },
 }
 
-DECIDE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "action": {"type": "string", "enum": ["plan", "execute"]},
-        "tasks": _ITEMS_SCHEMA,
-    },
-    "required": ["action"],
-}
-
-PLAN_CRITIQUE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "verdict": {
-            "type": "string", "enum": ["accept", "revise", "execute"],
-            "description": ("accept if plan is good, revise if it needs changes,"
-                            " execute if items should be collapsed into a"
-                            " single directly-executed task"),
-        },
-        "reason": {"type": "string"},
-        "revised_plan": _ITEMS_SCHEMA,
-    },
-    "required": ["verdict"],
-}
+# Name of the file the work agent writes when it has subtasks to delegate.
+# The critic reviews this alongside all other files, and the reviser can
+# modify it. After the critique cycle, work_node reads this to get the
+# (possibly revised) subtask list.
+SUBTASKS_FILE = "_bureau_subtasks.json"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -135,10 +121,12 @@ PLAN_CRITIQUE_SCHEMA: dict[str, Any] = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _parse_plan_items(result: Any) -> list[PlanItem]:
-    """Parse structured plan/decision result into [(desc, reads, writes)]."""
+    """Parse structured delegation/plan result into [(desc, reads, writes)]."""
     raw_items: list = []
     if isinstance(result, dict):
-        raw_items = result.get("items", result.get("tasks", []))
+        raw_items = result.get("subtasks",
+                               result.get("items",
+                                          result.get("tasks", [])))
     elif isinstance(result, list):
         raw_items = result
 
@@ -156,11 +144,33 @@ def _parse_plan_items(result: Any) -> list[PlanItem]:
     return items
 
 
+def _read_subtasks_file(cwd: str) -> list[PlanItem]:
+    """Read and clean up the subtasks file written by the work agent.
+
+    Returns parsed subtask list (empty if file doesn't exist or is invalid).
+    Deletes the file after reading.
+    """
+    path = Path(cwd) / SUBTASKS_FILE
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+        return _parse_plan_items(data)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning(f"Failed to read {SUBTASKS_FILE}: {e}")
+        return []
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def plan_or_execute(
+async def work_node(
     *,
     problem: str,
     phase: Phase,
@@ -178,10 +188,12 @@ async def plan_or_execute(
     concurrency_group: int | None = None,
     task_id: str | None = None,
 ) -> None:
-    """Unified recursive planning and execution.
+    """Unified recursive work node.
 
-    - depth < max:  agent chooses plan or execute
-    - depth >= max: always executes directly
+    Each node:
+    1. Executes partial work within a configurable budget
+    2. Gets a unified critique/revise cycle
+    3. Optionally delegates remaining subtasks to child nodes
     """
 
     # ── Task node ──────────────────────────────────────────────────────
@@ -217,76 +229,69 @@ async def plan_or_execute(
             cwd=work_cwd,
         )
 
-        # ── Leaf: force execute ────────────────────────────────────────
-        if depth >= cfg.max_depth:
-            log.info(f"  [{label}] max depth — executing directly")
-            emit_task_output(task_id, "max depth — executing directly")
-            await revision_cycle(
-                context=context,
-                task_description=task_description,
-                task_node=task_node,
-                critics=critics,
-                cwd=work_cwd, cfg=cfg,
-                phase_name=phase.name, label=label,
-            )
+        # ── Step 1: Execute work (and write subtasks file if needed) ─
+        can_delegate = depth < cfg.max_depth
+        log.info(f"  [{label}] executing work "
+                 f"(budget ~{cfg.work_budget} lines)")
+        emit_task_output(task_id,
+                         f"executing work (budget ~{cfg.work_budget} lines)")
+
+        await _execute_work(
+            context=context,
+            task_description=task_description,
+            task_node=task_node,
+            cwd=work_cwd, cfg=cfg,
+            phase=phase, label=label,
+            can_delegate=can_delegate,
+        )
+        git_commit(work_cwd, f"bureau: {label} work")
+
+        # Gate check
+        listing = repo_file_listing(work_cwd)
+        if "(empty repository" in listing:
+            log.warning(f"  [{label}] produced no files — skipping")
+            STATE.update_task_status(task_id, TaskStatus.COMPLETED)
             return
 
-        # ── Agent decides: plan (split) or execute directly ──────────
-        action, plan_items = await _decide(
-            context=context, task_description=task_description,
-            cwd=work_cwd, cfg=cfg, label=label,
-            phase=phase, task_id=task_id, depth=depth,
+        # ── Step 2: Critique and revise ────────────────────────────────
+        # The critic sees all files including _bureau_subtasks.json
+        # (if the work agent wrote one), so the revision cycle covers
+        # both the work done and the proposed delegation plan.
+        await critique_and_revise(
+            context=context,
+            task_description=task_description,
+            task_node=task_node,
+            critics=critics,
+            cwd=work_cwd, cfg=cfg,
+            phase_name=phase.name, label=label,
         )
-        if action == "execute" or not plan_items:
-            log.info(f"  [{label}] executing directly")
-            emit_task_output(task_id, "decided: execute directly")
-            await revision_cycle(
-                context=context,
-                task_description=task_description,
-                task_node=task_node,
-                critics=critics,
-                cwd=work_cwd, cfg=cfg,
-                phase_name=phase.name, label=label,
+
+        # ── Step 3: Read (possibly revised) subtasks and run them ─────
+        subtasks = _read_subtasks_file(work_cwd)
+        if subtasks:
+            log.info(f"  [{label}] delegating "
+                     f"{len(subtasks)} subtasks")
+            emit_task_output(
+                task_id,
+                f"delegating {len(subtasks)} subtasks")
+            for i, (desc, reads, writes) in enumerate(subtasks):
+                rstr = (f" R[{', '.join(sorted(reads)[:3])}]"
+                        if reads else "")
+                wstr = (f" W[{', '.join(sorted(writes)[:3])}]"
+                        if writes else "")
+                log.info(f"    {i+1}. {desc}{rstr}{wstr}")
+                emit_task_output(
+                    task_id, f"  {i+1}. {desc}{rstr}{wstr}")
+
+            await _run_children(
+                plan_items=subtasks,
+                problem=problem, phase=phase,
+                prev_phases=prev_phases,
+                critics=critics, cwd=work_cwd, cfg=cfg,
+                label=label, depth=depth, task_id=task_id,
+                worktree_mgr=worktree_mgr,
             )
-            return
-        plan_items, exec_desc = await _critique_plan(
-            items=plan_items, context=context, cwd=work_cwd,
-            cfg=cfg, label=label, phase=phase, task_id=task_id,
-        )
 
-        # Critic may collapse plan to execute-directly (returns None)
-        if plan_items is None:
-            final_desc = exec_desc or task_description
-            log.info(f"  [{label}] plan critic: execute directly")
-            emit_task_output(task_id, "plan critic: collapsed to execute")
-            task_node.description = final_desc
-            emit_event("task", task_node.to_dict())
-            await revision_cycle(
-                context=context,
-                task_description=final_desc,
-                task_node=task_node,
-                critics=critics,
-                cwd=work_cwd, cfg=cfg,
-                phase_name=phase.name, label=label,
-            )
-            return
-
-        # ── Execute the plan ───────────────────────────────────────────
-        log.info(f"  [{label}] planned {len(plan_items)} sub-tasks")
-        emit_task_output(task_id, f"planned {len(plan_items)} sub-tasks")
-        for i, (desc, reads, writes) in enumerate(plan_items):
-            rstr = f" R[{', '.join(sorted(reads)[:3])}]" if reads else ""
-            wstr = f" W[{', '.join(sorted(writes)[:3])}]" if writes else ""
-            log.info(f"    {i+1}. {desc}{rstr}{wstr}")
-            emit_task_output(task_id, f"  {i+1}. {desc}{rstr}{wstr}")
-
-        await _run_children(
-            plan_items=plan_items,
-            problem=problem, phase=phase, prev_phases=prev_phases,
-            critics=critics, cwd=work_cwd, cfg=cfg,
-            label=label, depth=depth, task_id=task_id,
-            worktree_mgr=worktree_mgr,
-        )
         STATE.update_task_status(task_id, TaskStatus.COMPLETED)
 
     except asyncio.CancelledError:
@@ -304,213 +309,129 @@ async def plan_or_execute(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Planning stages
+# Work execution
 # ═══════════════════════════════════════════════════════════════════════════
 
-PARALLELISM_INSRUCTIONS = textwrap.dedent("""\
-        IMPORTANT — Parallelism and dependency rules:
-    
+async def _execute_work(
+    *,
+    context: str,
+    task_description: str,
+    task_node: TaskNode,
+    cwd: str,
+    cfg: Config,
+    phase: Phase,
+    label: str,
+    can_delegate: bool,
+) -> None:
+    """Execute work within the configured budget.
+
+    If the agent has remaining work to delegate, it writes a
+    _bureau_subtasks.json file which the critic will review alongside
+    all other output.
+    """
+    writes = task_node.file_writes
+    reads = task_node.file_reads
+    file_constraint = ""
+    if writes:
+        wlist = ", ".join(writes)
+        file_constraint += f"\n        You MUST write these files: {wlist}"
+        file_constraint += "\n        Do NOT create or modify any other files."
+    if reads:
+        rlist = ", ".join(reads)
+        file_constraint += f"\n        You may read (but not modify): {rlist}"
+    if not writes and not reads:
+        file_constraint = ("\n        Only create or modify files within your"
+                           " working directory.")
+
+    work_budget = cfg.work_budget
+    delegation_instructions = ""
+    if can_delegate:
+        delegation_instructions = textwrap.dedent(f"""\
+
+            ### Delegation
+            If this task is larger than your budget allows, do as much as you
+            can and then write a file called `{SUBTASKS_FILE}` containing a
+            JSON array of remaining subtasks. Each subtask will be handled by
+            a separate agent that can read the files you wrote.
+
+            Each subtask object should have:
+            - `description`: what the subtask should do
+            - `reads`: list of files it needs to read (inputs/dependencies)
+            - `writes`: list of files it will create or modify
+
+            Maximum {cfg.max_split_pieces} subtasks.
+
+            {PARALLELISM_INSTRUCTIONS.format(work_budget=work_budget, lines_per_file=work_budget // 5)}
+
+            A reviewer will examine both your work AND the subtask list,
+            and may revise the delegation plan. Do NOT write `{SUBTASKS_FILE}`
+            if all work is complete — only if there is genuine remaining work.
+        """)
+    else:
+        delegation_instructions = textwrap.dedent("""\
+
+            You are at maximum decomposition depth. Complete ALL work for
+            this task — no further delegation is possible.
+        """)
+
+    work_prompt = context + textwrap.dedent(f"""\
+        ## Your role: WORKER
+
+        Execute the following task. You have a work budget of approximately
+        {work_budget} lines of output text. Do as much meaningful work as
+        you can within this scope.
+
+        ### Task
+        {task_description}
+{file_constraint}
+
+        ### Guidelines
+        - Read existing project files first to understand the current state.
+        - Prioritize foundational work: key structures, interfaces, core logic.
+        - Write real, complete code/content — not stubs or placeholders.
+        - Every piece you write must be fully implemented.
+{delegation_instructions}
+    """)
+
+    task_node.task_type = "executor"
+    emit_event("task", task_node.to_dict())
+
+    await run_agent(
+        prompt=work_prompt, cwd=cwd, cfg=cfg, label=f"{label}/work",
+        phase_name=phase.name, task_type="executor",
+        task_id=task_node.id,
+    )
+
+
+
+PARALLELISM_INSTRUCTIONS = textwrap.dedent("""\
+        IMPORTANT — Parallelism and dependency rules for subtasks:
+
         - Each sub-task must write to DIFFERENT files. No two sub-tasks may
           write to the same file.
-    
+
         - Multiple sub-tasks MAY read the same file — readers don't block each
           other.
-    
+
         - A sub-task that reads a file written by another sub-task will wait for
           that writer to finish first. Use this to express dependencies: if task
           B needs the output of task A, list A's output file in B's reads.
-    
+
         - Prefer creating many small files over few large ones. More files
           allows expressing finer-grained dependencies and more parallelism, and
           is easier to manage and review without exhausting an agent.
 
         - You do not need to make separate _tasks_ to read or write separate
           _files_. A single agent can comfortably read, write and revise text on
-          the order of 2000 lines (e.g. 5 files of 400 lines each). If the task
-          would likely involve more reading/writing than that, it's a good
-          candidate for splitting, but if it's below that scale, it's often
-          better to keep it as one task to avoid unnecessary overhead.
-    
+          the order of {work_budget} lines (e.g. 5 files of {lines_per_file}
+          lines each). If the task would likely involve more reading/writing than
+          that, it's a good candidate for splitting, but if it's below that
+          scale, it's often better to keep it as one task to avoid unnecessary
+          overhead.
+
         - All files must be within the project working directory. Do NOT create
           or modify files outside it.
 """)
-
-async def _decide(
-    *, context: str, task_description: str, cwd: str, cfg: Config,
-    label: str, phase: Phase, task_id: str, depth: int,
-) -> tuple[str, list[PlanItem]]:
-    """Intermediate-level decision: plan (split) or execute."""
-    next_msg = ("the last (must execute)"
-                if depth + 1 >= cfg.max_depth else "intermediate")
-    prompt = context + textwrap.dedent(f"""\ ## Your role: PLANNER
-
-        Decide how to handle the following task:
-
-        ### Task {task_description}
-
-        ### Options
-         
-        **plan** — This task involves multiple distinct parts (different files,
-        different components). Break it into sub-tasks (max
-        {cfg.max_split_pieces}). For each sub-task, describe what to do and list
-        the files it will **read** (inputs/dependencies) and **write** (create
-        or modify).
-
-        **execute** — This task is small and focused enough to implement
-        directly (e.g. likely to fit within ~2000 lines of text spread across
-        one or a few files).
-
-        {PARALLELISM_INSRUCTIONS}
-    
-        Depth: {depth}/{cfg.max_depth}. Next level is {next_msg}.
-    """)
-    decision = await run_structured_agent(
-        prompt=prompt, schema=DECIDE_SCHEMA,
-        cwd=cwd, cfg=cfg, label=f"{label}/plan",
-        phase_name=phase.name, task_type="planner",
-        task_id=task_id,
-    )
-    if decision is None or not isinstance(decision, dict):
-        return ("execute", [])
-
-    action = decision.get("action", "execute")
-    items = _parse_plan_items(decision) if action == "plan" else []
-    return (action, items)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Plan critique (in-memory)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _format_plan_for_review(items: list[PlanItem]) -> str:
-    """Format plan items as numbered text for critique prompts."""
-    lines = []
-    for i, (desc, reads, writes) in enumerate(items):
-        parts = [f"  {i+1}. {desc}"]
-        if writes:
-            parts.append(f"     writes: {', '.join(sorted(writes))}")
-        if reads:
-            parts.append(f"     reads: {', '.join(sorted(reads))}")
-        lines.append("\n".join(parts))
-    return "\n".join(lines)
-
-
-async def _critique_plan(
-    *, items: list[PlanItem], context: str, cwd: str, cfg: Config,
-    label: str, phase: Phase, task_id: str,
-) -> tuple[list[PlanItem] | None, str | None]:
-    """Run one critique pass on a plan.
-
-    Returns (revised_items, None) to continue planning,
-    or (None, task_description) to collapse and execute directly.
-    """
-    plan_text = _format_plan_for_review(items)
-    prompt = context + textwrap.dedent(f"""\ ## Your role: PLAN CRITIC
-
-        Review the following plan and decide whether it is good or needs
-        revision.
-
-        ### Plan ({len(items)} items)
-{plan_text}
-
-        ### What to check
-
-        - **Too-small tasks**: If a task is too big it will be re-split by a
-          sub-agent, you don't have to worry about that. But if a task is too
-          _small_ you might want to merge it with others to avoid unnecessary
-          overhead. A single agent can comfortably read, write and revise text
-          on the order of 2000 lines (e.g. 5 files of 400 lines each). If a task
-          would likely involve more reading/writing than that, it's a good
-          candidate for splitting, but if it's below that scale, it's often
-          better to keep it as one task to avoid unnecessary overhead.
-
-        - **Redundant tasks**: Are there tasks that do close-enough to "the same
-          thing" that they should be merged?
-
-        - **Dependent tasks**: If two tasks are strictly dependent (one reads a
-          file the other writes), they will not be able to run in parallel, so
-          the only reason to keep them separate is if the combined task would be
-          too big for a single agent's work. Consider the size and decide on
-          split vs. merge.
-
-        - **Overlap**: Do multiple tasks write to the same files? That's a
-          conflict — merge them or reassign files.
-
-        - **Missing deps**: Does a task read a file that no other task writes?
-          That's fine (it exists already). But if it reads a file another task
-          creates, is that dependency listed?
-
-        - **Scope creep**: Does any task go beyond the phase goal?
-
-        ### Decision
-        
-          - **accept**: The plan is reasonable. Minor imperfections are fine.
-        
-          - **revise**: The plan has real problems. Provide a `revised_plan`
-            with the corrected items. Keep the same format (description, reads,
-            writes).
-
-          - **execute**: The items should be collapsed into a single task and
-            executed directly (e.g. you merged everything down to one item).
-            You may optionally provide a single-item `revised_plan` with the
-            merged task description; otherwise the original task description
-            will be used.
-
-        Be pragmatic. Only revise if there are genuine problems, not style nits.
-    """)
-
-    emit_task_output(task_id, "critiquing plan...")
-    result = await run_structured_agent(
-        prompt=prompt, schema=PLAN_CRITIQUE_SCHEMA,
-        cwd=cwd, cfg=cfg, label=f"{label}/plan-critic",
-        phase_name=phase.name, task_type="planner",
-        task_id=task_id,
-    )
-
-    if not isinstance(result, dict):
-        return items, None
-
-    verdict = result.get("verdict", "accept")
-    reason = result.get("reason", "")
-
-    # Helper: extract a merged description from revised_plan if present
-    def _extract_exec_desc() -> str | None:
-        rp = result.get("revised_plan")
-        if rp:
-            parsed = _parse_plan_items({"items": rp})
-            if parsed:
-                return parsed[0][0]  # description of first item
-        return None
-
-    if verdict == "execute":
-        merged_desc = _extract_exec_desc()
-        log.info(f"  [{label}] plan critic: execute directly — {reason}")
-        emit_task_output(task_id,
-                         f"plan collapsed to execute: {reason}")
-        return None, merged_desc
-
-    if verdict == "revise" and result.get("revised_plan"):
-        revised = _parse_plan_items({"items": result["revised_plan"]})
-        if revised:
-            # If revised down to 1 item, treat as execute
-            if len(revised) == 1:
-                log.info(f"  [{label}] plan revised to single item — "
-                         f"will execute directly: {reason}")
-                emit_task_output(task_id,
-                                 f"plan revised to single task "
-                                 f"(executing directly): {reason}")
-                return None, revised[0][0]
-            log.info(f"  [{label}] plan revised: {reason}")
-            emit_task_output(task_id,
-                             f"plan revised ({len(items)}→{len(revised)}): "
-                             f"{reason}")
-            return revised, None
-        log.warning(f"  [{label}] critic said revise but gave empty plan")
-    else:
-        log.info(f"  [{label}] plan accepted: {reason}")
-        emit_task_output(task_id, f"plan accepted: {reason}")
-
-    return items, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -560,7 +481,7 @@ async def _run_children(
         for gi, group in enumerate(groups):
             if len(group) == 1:
                 i, (desc, reads, writes) = group[0]
-                await plan_or_execute(
+                await work_node(
                     problem=problem, phase=phase, prev_phases=prev_phases,
                     task_description=desc, critics=critics,
                     cwd=cwd, cfg=cfg, label=f"{label}/{i+1}",
@@ -572,7 +493,7 @@ async def _run_children(
                 )
             else:
                 await asyncio.gather(*(
-                    plan_or_execute(
+                    work_node(
                         problem=problem, phase=phase, prev_phases=prev_phases,
                         task_description=desc, critics=critics,
                         cwd=cwd, cfg=cfg, label=f"{label}/{i+1}",
@@ -587,7 +508,7 @@ async def _run_children(
             git_commit(cwd, f"bureau: {label} group done")
     else:
         for i, (desc, reads, writes) in enumerate(plan_items):
-            await plan_or_execute(
+            await work_node(
                 problem=problem, phase=phase, prev_phases=prev_phases,
                 task_description=desc, critics=critics,
                 cwd=cwd, cfg=cfg, label=f"{label}/{i+1}",
