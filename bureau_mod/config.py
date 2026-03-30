@@ -34,6 +34,7 @@ class Phase:
 class Critic:
     role: str
     prompt: str
+    globs: list[str] | None = None  # file globs; None/empty = matches all
 
 
 @dataclass
@@ -64,9 +65,9 @@ class Config:
     timeout: float = 600.0
     stall_timeout: float = 120.0
     permission_mode: str = "bypassPermissions"
-    parallel_critics: bool = True
     parallel_subtasks: bool = True
     max_parallel: int = 16
+    work_budget: int = 2000
     use_worktrees: bool = True
     web_port: int = 8765
     setting_sources: list[str] = field(
@@ -93,9 +94,9 @@ class Config:
             # Simple scalar fields
             for k in ("model", "effort", "thinking", "max_depth",
                        "max_revision_rounds", "max_split_pieces", "timeout",
-                       "stall_timeout", "permission_mode", "parallel_critics",
+                       "stall_timeout", "permission_mode",
                        "parallel_subtasks", "max_parallel", "use_worktrees",
-                       "web_port", "setting_sources"):
+                       "web_port", "setting_sources", "work_budget"):
                 if k in raw:
                     setattr(cfg, k, raw[k])
 

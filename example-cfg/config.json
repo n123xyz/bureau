@@ -5,9 +5,9 @@
   "max_depth": 2,
   "max_revision_rounds": 1,
   "max_split_pieces": 8,
+  "work_budget": 500,
   "timeout": 600,
   "stall_timeout": 600,
-  "parallel_critics": true,
   "parallel_subtasks": true,
   "max_parallel": 8,
   "use_worktrees": true

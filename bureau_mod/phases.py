@@ -1,4 +1,4 @@
-"""Phase runner: plan and execute phases sequentially."""
+"""Phase runner: execute phases sequentially."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from bureau_mod.config import Config, Critic, Phase
-from bureau_mod.decompose import plan_or_execute
+from bureau_mod.decompose import work_node
 from bureau_mod.git_utils import git_commit
 from bureau_mod.state import STATE, TaskNode, emit_event
 from bureau_mod.worktree import WorktreeManager
@@ -44,8 +44,8 @@ async def run_phase(
     )
     STATE.add_task(root_task)
 
-    # depth=0 forces planning; recursion handles everything from here
-    await plan_or_execute(
+    # depth=0: work node handles execution, critique, and delegation
+    await work_node(
         problem=problem, phase=phase, prev_phases=prev_phases,
         task_description=phase.goal, critics=critics,
         cwd=cwd, cfg=cfg, label=phase.name, depth=0,

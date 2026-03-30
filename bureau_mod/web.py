@@ -409,8 +409,8 @@ a:hover { text-decoration: underline; }
   <h1>🏢 Bureau</h1>
   <div class="stats">
     <div class="stat"><div class="stat-val" id="s-agents">0</div><div class="stat-lbl">Agents</div></div>
-    <div class="stat"><div class="stat-val" id="s-cost">$0</div><div class="stat-lbl">Cost</div></div>
-    <div class="stat"><div class="stat-val" id="s-tokens">0</div><div class="stat-lbl">Tokens</div></div>
+    <div class="stat" title="Estimated API-equivalent cost (from Claude Code SDK token pricing). Subscription plan users are not billed per-token — this is for estimation only."><div class="stat-val" id="s-cost">$0</div><div class="stat-lbl">API Cost*</div></div>
+    <div class="stat" title="Total input / output tokens across all agents (includes prompt cache tokens in input count)"><div class="stat-val" id="s-tokens">0</div><div class="stat-lbl">Tokens (in/out)</div></div>
     <div class="stat"><div class="stat-val" id="s-commits">0</div><div class="stat-lbl">Commits</div></div>
     <div class="stat"><div class="stat-val" id="s-util">—</div><div class="stat-lbl">Utilization</div></div>
   </div>
@@ -516,11 +516,12 @@ function renderAll() {
 
 function updateStats(d) {
   if (d.total_agents !== undefined) document.getElementById('s-agents').textContent = d.total_agents;
-  if (d.total_cost !== undefined) document.getElementById('s-cost').textContent = '$' + d.total_cost.toFixed(4);
+  if (d.total_cost !== undefined) document.getElementById('s-cost').textContent = '$' + d.total_cost.toFixed(2);
   if (d.total_input_tokens !== undefined || d.total_output_tokens !== undefined) {
     const inp = d.total_input_tokens || S.total_input_tokens || 0;
     const out = d.total_output_tokens || S.total_output_tokens || 0;
-    document.getElementById('s-tokens').textContent = ((inp+out)/1000).toFixed(0) + 'k';
+    const fmtK = (n) => n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : (n/1000).toFixed(0) + 'k';
+    document.getElementById('s-tokens').textContent = fmtK(inp) + ' / ' + fmtK(out);
   }
   if (d.total_commits !== undefined) document.getElementById('s-commits').textContent = d.total_commits;
   if (d.rate_limit_utilization != null) {

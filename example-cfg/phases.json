@@ -1,7 +1,7 @@
 [
   {
     "name": "specification",
-    "goal": "Write a detailed technical specification covering all major categories of requirement: functional behaviour and correctness, performance constraints, interoperability and dependencies, security and robustness, user experience and accessibility, operations and portability, standards compliance, etc. etc. Also specify as much as necessary the intended form of the implementation in terms of key data structures, ownership and data flow; key control structures, error handling patterns and concurrent tasks/threads; any specific algorithms or edge cases; and a rough map of the module or subsystem structure."
+    "goal": "Write a detailed technical specification covering all major categories of requirement: functional behaviour and correctness, performance constraints, interoperability and dependencies, security and robustness, user experience and accessibility, operations and portability, standards compliance, etc. etc. Also specify as much as necessary the intended form of the implementation in terms of key data structures, ownership and data flow; key control structures, error handling patterns and concurrent tasks/threads; any specific algorithms or edge cases; and a rough map of the module or subsystem structure. When performing hierarchical decomposition, give units of the decomposition (files, chapters, sections, subsections, etc.) numbers to allow easy at-a-glance navigation, cross-referencing and spec-referencing in later code. You can also add filesystem directory structure, where appropriate."
   },
   {
     "name": "interfaces",
