@@ -150,11 +150,10 @@ def git_restore_to(cwd: str, commit: str) -> bool:
 
 def repo_file_listing(cwd: str) -> str:
     try:
+        # Use git ls-files to respect .gitignore rules
         r = subprocess.run(
-            ["find", ".", "-type", "f",
-             "-not", "-path", "./.git/*",
-             "-not", "-path", "./.claude/*",
-             "-not", "-name", "_bureau_*"],
+            ["git", "ls-files", "--cached", "--others",
+             "--exclude-standard"],
             cwd=cwd, capture_output=True, timeout=10, text=True,
         )
         files = sorted(r.stdout.strip().splitlines()) if r.stdout.strip() else []
