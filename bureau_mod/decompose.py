@@ -26,6 +26,12 @@ from bureau_mod.agents import run_agent
 from bureau_mod.config import Config, Critic, Phase
 from bureau_mod.context import make_context
 from bureau_mod.git_utils import git_commit, repo_file_listing
+from bureau_mod.prompts import (
+    HIERARCHY_CONTEXT,
+    PARALLELISM_RULES,
+    SUBTASKS_FILE,
+    SUBTASKS_SCHEMA_DOC,
+)
 from bureau_mod.revision import critique_and_revise
 from bureau_mod.state import STATE, TaskNode, TaskStatus, emit_event, emit_task_output
 from bureau_mod.worktree import WorktreeManager
@@ -108,12 +114,6 @@ _ITEMS_SCHEMA: dict[str, Any] = {
         "required": ["description"],
     },
 }
-
-# Name of the file the work agent writes when it has subtasks to delegate.
-# The critic reviews this alongside all other files, and the reviser can
-# modify it. After the critique cycle, work_node reads this to get the
-# (possibly revised) subtask list.
-SUBTASKS_FILE = "_bureau_subtasks.json"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -344,33 +344,20 @@ async def _execute_work(
                            " working directory.")
 
     work_budget = cfg.work_budget
-    delegation_instructions = ""
+    delegation_section = ""
     if can_delegate:
-        delegation_instructions = textwrap.dedent(f"""\
+        delegation_section = textwrap.dedent(f"""\
 
-            ### Delegation
-            If this task is larger than your budget allows, do as much as you
-            can and then write a file called `{SUBTASKS_FILE}` containing a
-            JSON array of remaining subtasks. Each subtask will be handled by
-            a separate agent that can read the files you wrote.
+            {SUBTASKS_SCHEMA_DOC}
+            Maximum {cfg.max_split_pieces} subtasks. Each child node gets the
+            same ~{work_budget}-line budget, so size subtasks accordingly.
 
-            Each subtask object should have:
-            - `description`: what the subtask should do
-            - `reads`: list of files it needs to read (inputs/dependencies)
-            - `writes`: list of files it will create or modify
-
-            Maximum {cfg.max_split_pieces} subtasks. Each subtask agent has
-            the same ~{work_budget}-line budget you do, so size subtasks
-            accordingly.
-
-            {PARALLELISM_INSTRUCTIONS}
-
-            A reviewer will examine both your work AND the subtask list,
-            and may revise the delegation plan. Do NOT write `{SUBTASKS_FILE}`
-            if all work is complete — only if there is genuine remaining work.
+            {PARALLELISM_RULES}
+            Do NOT write `{SUBTASKS_FILE}` if all work is complete at this
+            level — only if sub-levels exist to delegate.
         """)
     else:
-        delegation_instructions = textwrap.dedent("""\
+        delegation_section = textwrap.dedent("""\
 
             You are at maximum decomposition depth. Complete ALL work for
             this task — no further delegation is possible.
@@ -379,11 +366,10 @@ async def _execute_work(
     work_prompt = context + textwrap.dedent(f"""\
         ## Your role: WORKER
 
-        Execute the following task. Your work budget is approximately
-        **{work_budget} lines total across all files you write**. This is
-        the combined line count of every file you create or modify. If the
-        task requires more than {work_budget} lines of file content, do the
-        most important {work_budget} lines and delegate the rest.
+        {HIERARCHY_CONTEXT}
+        Your budget at this level: **~{work_budget} lines total across all
+        files you write** (combined line count of every file you create or
+        modify).
 
         ### Task
         {task_description}
@@ -391,21 +377,18 @@ async def _execute_work(
 
         ### Guidelines
         - Read existing project files first to understand the current state.
-        - Prioritize foundational work: key structures, interfaces, core logic.
+        - Do the work that belongs at your level of the hierarchy — create
+          the structures, interfaces, and content for this granularity.
         - Write real, complete code/content — not stubs or placeholders.
-        - Every piece you write must be fully implemented.
         - **Prefer many small files over few large ones.** Each file should
-          cover one module, component, or subject. This keeps files easy to
-          read and edit, and enables subtasks to work on separate files in
-          parallel without conflicts.
-        - Stay within your ~{work_budget}-line file-writing budget. If you
-          find yourself needing more, stop and delegate via subtasks.
-        - You can also delegate to a subtask if and when normal structures
-          of hierarchical decomposition make sense: chapters, sections and
-          subsections in prose; or packages, modules and functions in code.
-          If you are writing at one level, just try to do a good job given
-          your budget **at your level** and delegate the sub-levels.
-{delegation_instructions}
+          cover one module, component, or subject. This enables subtasks to
+          work on separate files in parallel without conflicts.
+        - Stay within your ~{work_budget}-line budget. When you hit it, or
+          when natural sub-levels exist, delegate via `{SUBTASKS_FILE}`.
+        - Delegation is not just for overflow — use it whenever the work has
+          natural subdivisions (chapters→sections, packages→modules, etc.).
+          Do your level well and let children handle the details.
+{delegation_section}
     """)
 
     task_node.task_type = "executor"
@@ -417,24 +400,6 @@ async def _execute_work(
         task_id=task_node.id,
     )
 
-
-
-PARALLELISM_INSTRUCTIONS = textwrap.dedent("""\
-        IMPORTANT — Parallelism and dependency rules for subtasks:
-
-        - Each sub-task must write to DIFFERENT files. No two sub-tasks may
-          write to the same file.
-
-        - Multiple sub-tasks MAY read the same file — readers don't block each
-          other.
-
-        - A sub-task that reads a file written by another sub-task will wait for
-          that writer to finish first. Use this to express dependencies: if task
-          B needs the output of task A, list A's output file in B's reads.
-
-        - All files must be within the project working directory. Do NOT create
-          or modify files outside it.
-""")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

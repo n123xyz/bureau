@@ -44,6 +44,22 @@ from bureau_mod.state import (
 log = logging.getLogger("bureau")
 
 
+def _extract_tokens(result: Any) -> tuple[int, int]:
+    """Extract cumulative input/output token counts from a ResultMessage.
+
+    The usage dict may contain cache-specific fields; include those in
+    the input total so the numbers actually reflect real usage.
+    """
+    if not result or not result.usage:
+        return 0, 0
+    u = result.usage
+    in_tok = (u.get("input_tokens", 0)
+              + u.get("cache_read_input_tokens", 0)
+              + u.get("cache_creation_input_tokens", 0))
+    out_tok = u.get("output_tokens", 0)
+    return in_tok, out_tok
+
+
 def _emit_structured_summary(task_id: str, output: dict[str, Any]) -> None:
     """Emit the full structured output content to the task log."""
     try:
@@ -287,10 +303,8 @@ async def run_agent(
                 STATE.cost_in_window += cost
                 elapsed = time.monotonic() - t0
                 turns = getattr(result, "num_turns", "?") if result else "?"
-                in_tok = (result.usage.get("input_tokens", 0)
-                          if result and result.usage else 0)
-                out_tok = (result.usage.get("output_tokens", 0)
-                           if result and result.usage else 0)
+                in_tok, out_tok = _extract_tokens(result)
+                log.debug(f"  [{label}] raw usage: {result.usage if result else None}")
                 STATE.total_input_tokens += in_tok
                 STATE.total_output_tokens += out_tok
                 log.info(f"  [{label}] done {elapsed:.1f}s  turns={turns}  "
@@ -423,10 +437,8 @@ async def run_structured_agent(
                 STATE.cost_in_window += cost
                 elapsed = time.monotonic() - t0
                 turns = getattr(result, "num_turns", "?") if result else "?"
-                in_tok = (result.usage.get("input_tokens", 0)
-                          if result and result.usage else 0)
-                out_tok = (result.usage.get("output_tokens", 0)
-                           if result and result.usage else 0)
+                in_tok, out_tok = _extract_tokens(result)
+                log.debug(f"  [{label}] raw usage: {result.usage if result else None}")
                 STATE.total_input_tokens += in_tok
                 STATE.total_output_tokens += out_tok
                 log.info(f"  [{label}] done {elapsed:.1f}s  turns={turns}  "

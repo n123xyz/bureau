@@ -20,6 +20,12 @@ from typing import Any
 
 from bureau_mod.agents import run_agent, run_structured_agent
 from bureau_mod.config import Config, Critic
+from bureau_mod.prompts import (
+    HIERARCHY_CONTEXT,
+    PARALLELISM_RULES,
+    SUBTASKS_FILE,
+    SUBTASKS_SCHEMA_DOC,
+)
 from bureau_mod.git_utils import git_commit, git_get_head, git_restore_to
 from bureau_mod.state import (
     PAUSE_EVENT,
@@ -146,42 +152,48 @@ async def _run_merged_critic(
     critic_prompt = context + textwrap.dedent(f"""\
         ## Your role: REVIEWER
 
-        Review the current state of the project files in light of the
-        task described below. Your review should consider all of the
-        following aspects holistically:
+        {HIERARCHY_CONTEXT}
+        {SUBTASKS_SCHEMA_DOC}
+        {PARALLELISM_RULES}
+
+        ### Review categories
+        Review the current state of the project files holistically,
+        considering all of the following aspects:
 
         {merged_prompt}
 
-        ### Task that was supposed to be executed
+        ### Task that was assigned to the worker
         {task_description}
 
-        Instructions:
+        ### Instructions
         - Read all relevant project files.
         - For each issue, specify the exact file and what needs to change.
-        - Be concrete: name functions, describe the fix, state expected behavior.
-        - Severity: "high" = missing functionality or bugs, "medium" = significant
-          improvement, "low" = cosmetic or style.
+        - Be concrete: name functions, describe the fix, state expected
+          behavior.
+        - Severity: "high" = missing functionality or bugs, "medium" =
+          significant improvement, "low" = cosmetic or style.
         - If everything is satisfactory, set clean=true and omit edits.
         - Do NOT fix anything. Only identify issues.
-        - Consider how issues relate to each other — a simplification might make
-          another issue moot, or a missing feature might change other priorities.
-        - If you see a `_bureau_subtasks.json` file, it describes work that
-          will be done LATER by child agents — it is a delegation plan, not
-          something that has run yet. This means:
-          * Files listed in the subtasks' "writes" fields DO NOT EXIST YET.
-            That is expected. Do NOT flag missing files as bugs if they are
-            listed as outputs of a pending subtask.
-          * Code at this level may contain forward references (imports,
-            calls, type annotations) to things that subtasks will create.
-            This is intentional — the subtasks will fill in those gaps.
-            Likewise docs may make reference to not-yet-written chapters
-            or sections. That is not a cause for concern if the forward
-            reference is to work mentioned in _bureau_subtasks.json.
-          * DO review the delegation plan itself: are subtasks well-scoped?
-            Redundant? Missing coverage? Should some be merged or split?
-            You may list issues against `_bureau_subtasks.json` and the
-            reviser can modify it.
-        - Only review files within the working directory.
+        - Consider how issues interact — a simplification might make a
+          correctness issue moot, a missing feature might change priorities.
+
+        ### Reviewing delegation
+        If you see a `{SUBTASKS_FILE}` file:
+        - It is a delegation plan for child nodes, NOT work that has run.
+        - Files listed in subtasks' "writes" DO NOT EXIST YET. Do NOT flag
+          them as missing — children will create them.
+        - Forward references (imports, calls, doc cross-references) to
+          things children will create are expected and not bugs.
+        - DO review the plan itself: are subtasks well-scoped? Redundant?
+          Missing coverage? Should any be merged or split? You may list
+          issues against `{SUBTASKS_FILE}` and the reviser can modify it.
+
+        If you do NOT see a `{SUBTASKS_FILE}` file, the worker chose not
+        to delegate. If you believe sub-levels of work exist that should
+        be delegated, you can suggest creating `{SUBTASKS_FILE}` with
+        appropriate entries (using the schema described above).
+
+        Only review files within the working directory.
     """)
 
     result = await run_structured_agent(
@@ -353,6 +365,8 @@ async def critique_and_revise(
             - Address every issue in the list above.
             - For each issue, make the minimum change needed.
             - Do NOT refactor unrelated code.
+            - If issues reference `{SUBTASKS_FILE}`, you may edit that file
+              (it is a JSON delegation plan — see the reviewer's notes).
             - Only modify files within your working directory.
         """)
 
