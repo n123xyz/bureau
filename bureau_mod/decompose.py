@@ -359,9 +359,11 @@ async def _execute_work(
             - `reads`: list of files it needs to read (inputs/dependencies)
             - `writes`: list of files it will create or modify
 
-            Maximum {cfg.max_split_pieces} subtasks.
+            Maximum {cfg.max_split_pieces} subtasks. Each subtask agent has
+            the same ~{work_budget}-line budget you do, so size subtasks
+            accordingly.
 
-            {PARALLELISM_INSTRUCTIONS.format(work_budget=work_budget, lines_per_file=work_budget // 5)}
+            {PARALLELISM_INSTRUCTIONS}
 
             A reviewer will examine both your work AND the subtask list,
             and may revise the delegation plan. Do NOT write `{SUBTASKS_FILE}`
@@ -377,9 +379,11 @@ async def _execute_work(
     work_prompt = context + textwrap.dedent(f"""\
         ## Your role: WORKER
 
-        Execute the following task. You have a work budget of approximately
-        {work_budget} lines of output text. Do as much meaningful work as
-        you can within this scope.
+        Execute the following task. Your work budget is approximately
+        **{work_budget} lines total across all files you write**. This is
+        the combined line count of every file you create or modify. If the
+        task requires more than {work_budget} lines of file content, do the
+        most important {work_budget} lines and delegate the rest.
 
         ### Task
         {task_description}
@@ -390,6 +394,8 @@ async def _execute_work(
         - Prioritize foundational work: key structures, interfaces, core logic.
         - Write real, complete code/content — not stubs or placeholders.
         - Every piece you write must be fully implemented.
+        - Stay within your ~{work_budget}-line file-writing budget. If you
+          find yourself needing more, stop and delegate via subtasks.
 {delegation_instructions}
     """)
 
@@ -416,18 +422,6 @@ PARALLELISM_INSTRUCTIONS = textwrap.dedent("""\
         - A sub-task that reads a file written by another sub-task will wait for
           that writer to finish first. Use this to express dependencies: if task
           B needs the output of task A, list A's output file in B's reads.
-
-        - Prefer creating many small files over few large ones. More files
-          allows expressing finer-grained dependencies and more parallelism, and
-          is easier to manage and review without exhausting an agent.
-
-        - You do not need to make separate _tasks_ to read or write separate
-          _files_. A single agent can comfortably read, write and revise text on
-          the order of {work_budget} lines (e.g. 5 files of {lines_per_file}
-          lines each). If the task would likely involve more reading/writing than
-          that, it's a good candidate for splitting, but if it's below that
-          scale, it's often better to keep it as one task to avoid unnecessary
-          overhead.
 
         - All files must be within the project working directory. Do NOT create
           or modify files outside it.
