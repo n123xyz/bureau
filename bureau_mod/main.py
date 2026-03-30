@@ -175,8 +175,9 @@ async def run(args: argparse.Namespace) -> None:
         git_commit(cwd, "bureau: final state")
         log.info(f"DONE. agents={STATE.total_agents}  "
                  f"commits={STATE.total_commits}  "
-                 f"cost=${STATE.total_cost:.4f}  "
-                 f"tokens={STATE.total_input_tokens+STATE.total_output_tokens}")
+                 f"api_cost=${STATE.total_cost:.2f}  "
+                 f"tokens={STATE.total_input_tokens}in/"
+                 f"{STATE.total_output_tokens}out")
 
         checkpoint_path = config_dir / "checkpoint.json"
         STATE.save_checkpoint(checkpoint_path)

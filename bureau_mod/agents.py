@@ -308,15 +308,16 @@ async def run_agent(
                 STATE.total_input_tokens += in_tok
                 STATE.total_output_tokens += out_tok
                 log.info(f"  [{label}] done {elapsed:.1f}s  turns={turns}  "
-                         f"tok={in_tok}/{out_tok}  cost=${cost:.4f}")
+                         f"tok={in_tok}in/{out_tok}out  "
+                         f"api_cost=${cost:.4f}")
                 log.debug(f"  [{label}] RESPONSE ({len(text)} chars):\n{text}")
                 emit_stats()
 
                 if task_id:
                     emit_task_output(
                         task_id,
-                        f"done {elapsed:.1f}s tok={in_tok}/{out_tok} "
-                        f"cost=${cost:.4f}"
+                        f"done {elapsed:.1f}s tok={in_tok}in/{out_tok}out "
+                        f"~${cost:.4f}"
                     )
 
                 if result and result.is_error:
@@ -442,7 +443,8 @@ async def run_structured_agent(
                 STATE.total_input_tokens += in_tok
                 STATE.total_output_tokens += out_tok
                 log.info(f"  [{label}] done {elapsed:.1f}s  turns={turns}  "
-                         f"tok={in_tok}/{out_tok}  cost=${cost:.4f}")
+                         f"tok={in_tok}in/{out_tok}out  "
+                         f"api_cost=${cost:.4f}")
                 emit_stats()
 
                 if result and result.is_error:
