@@ -400,6 +400,11 @@ async def _execute_work(
           parallel without conflicts.
         - Stay within your ~{work_budget}-line file-writing budget. If you
           find yourself needing more, stop and delegate via subtasks.
+        - You can also delegate to a subtask if and when normal structures
+          of hierarchical decomposition make sense: chapters, sections and
+          subsections in prose; or packages, modules and functions in code.
+          If you are writing at one level, just try to do a good job given
+          your budget **at your level** and delegate the sub-levels.
 {delegation_instructions}
     """)
 
