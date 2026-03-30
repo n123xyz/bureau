@@ -165,10 +165,22 @@ async def _run_merged_critic(
         - Do NOT fix anything. Only identify issues.
         - Consider how issues relate to each other — a simplification might make
           another issue moot, or a missing feature might change other priorities.
-        - If you see a `_bureau_subtasks.json` file, review the delegation plan
-          too. Are the subtasks well-scoped? Redundant? Missing something?
-          Should some be merged or split? You may list issues against that file
-          and the reviser can modify it.
+        - If you see a `_bureau_subtasks.json` file, it describes work that
+          will be done LATER by child agents — it is a delegation plan, not
+          something that has run yet. This means:
+          * Files listed in the subtasks' "writes" fields DO NOT EXIST YET.
+            That is expected. Do NOT flag missing files as bugs if they are
+            listed as outputs of a pending subtask.
+          * Code at this level may contain forward references (imports,
+            calls, type annotations) to things that subtasks will create.
+            This is intentional — the subtasks will fill in those gaps.
+            Likewise docs may make reference to not-yet-written chapters
+            or sections. That is not a cause for concern if the forward
+            reference is to work mentioned in _bureau_subtasks.json.
+          * DO review the delegation plan itself: are subtasks well-scoped?
+            Redundant? Missing coverage? Should some be merged or split?
+            You may list issues against `_bureau_subtasks.json` and the
+            reviser can modify it.
         - Only review files within the working directory.
     """)
 
