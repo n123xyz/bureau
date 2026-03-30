@@ -394,6 +394,10 @@ async def _execute_work(
         - Prioritize foundational work: key structures, interfaces, core logic.
         - Write real, complete code/content — not stubs or placeholders.
         - Every piece you write must be fully implemented.
+        - **Prefer many small files over few large ones.** Each file should
+          cover one module, component, or subject. This keeps files easy to
+          read and edit, and enables subtasks to work on separate files in
+          parallel without conflicts.
         - Stay within your ~{work_budget}-line file-writing budget. If you
           find yourself needing more, stop and delegate via subtasks.
 {delegation_instructions}
