@@ -34,12 +34,66 @@ from bureau_mod.prompts import (
 )
 from bureau_mod.revision import critique_and_revise
 from bureau_mod.state import STATE, TaskNode, TaskStatus, emit_event, emit_task_output
-from bureau_mod.worktree import WorktreeManager
+from bureau_mod.worktree import ConflictResolver, WorktreeManager
 
 log = logging.getLogger("bureau")
 
 # (description, reads, writes)
 PlanItem = tuple[str, set[str], set[str]]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Merge-conflict resolver (uses a lightweight agent)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_conflict_resolver(
+    cfg: Config, phase_name: str, label: str,
+) -> ConflictResolver:
+    """Return an async callback that resolves git merge conflicts via an agent."""
+
+    async def _resolve(repo_path: str, conflicted_files: list[str]) -> bool:
+        file_list = "\n".join(f"  - {f}" for f in conflicted_files)
+        prompt = textwrap.dedent(f"""\
+            ## Merge-conflict resolution
+
+            A git merge is in progress and the following files contain
+            conflict markers that MUST be resolved:
+
+            {file_list}
+
+            For **each** file listed above:
+
+            1. Read the file — it contains standard git conflict markers
+               (`<<<<<<< HEAD`, `=======`, `>>>>>>> branch`).
+            2. The `HEAD` side contains previously-merged work from other
+               parallel tasks.  The incoming (`>>>>>>>`) side contains the
+               newest work from the current task.
+            3. Produce a clean merged version that **incorporates both
+               sides' changes**.  Use your understanding of the code /
+               content to combine them correctly — don't just pick one
+               side.
+            4. Write the resolved file back (overwriting the conflicted
+               version).
+
+            **Rules**
+            - Do NOT leave ANY conflict markers (`<<<<<<<`, `=======`,
+              `>>>>>>>`) in any file.
+            - Do NOT modify files that are not listed above.
+            - The result must be syntactically valid and logically
+              coherent.
+        """)
+
+        await run_agent(
+            prompt=prompt,
+            cwd=repo_path,
+            cfg=cfg,
+            phase_name=phase_name,
+            task_type="executor",
+            label=f"{label}/merge-resolve",
+        )
+        return True
+
+    return _resolve
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -303,9 +357,16 @@ async def work_node(
         log.debug(traceback.format_exc())
     finally:
         if cfg.use_worktrees and worktree_mgr and work_cwd != cwd:
-            await worktree_mgr.merge_and_cleanup(
-                task_id, f"bureau: {label} complete"
+            resolver = _make_conflict_resolver(cfg, phase.name, label)
+            ok = await worktree_mgr.merge_and_cleanup(
+                task_id, f"bureau: {label} complete",
+                conflict_resolver=resolver,
             )
+            if not ok:
+                log.error(f"  [{label}] merge back to main FAILED — "
+                          f"work may be lost for {task_id}")
+                emit_task_output(task_id,
+                                 "WARNING: merge to main failed")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

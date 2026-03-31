@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Callable, Awaitable
 
 log = logging.getLogger("bureau")
+
+# Type for an async conflict resolver callback:
+#   (repo_path: str, conflicted_files: list[str]) -> bool
+ConflictResolver = Callable[[str, list[str]], Awaitable[bool]]
+
+# Pattern matching git conflict markers
+_CONFLICT_RE = re.compile(r"^<{7} ", re.MULTILINE)
 
 
 class WorktreeManager:
@@ -79,8 +88,15 @@ class WorktreeManager:
                 return self.main_repo
 
     async def merge_and_cleanup(self, task_id: str,
-                                commit_message: str | None = None) -> bool:
-        """Merge worktree changes back to main and clean up."""
+                                commit_message: str | None = None,
+                                conflict_resolver: ConflictResolver | None = None,
+                                ) -> bool:
+        """Merge worktree changes back to main and clean up.
+
+        If a merge conflict occurs:
+          1. Try agent-based resolution via *conflict_resolver* callback
+          2. Fall back to ``git merge -X theirs`` (prefer the task branch)
+        """
         async with self._lock:
             if task_id not in self.active_worktrees:
                 return True
@@ -120,9 +136,9 @@ class WorktreeManager:
                 stdout, _ = await proc.communicate()
                 branch_name = stdout.decode().strip()
 
+                merge_msg = f"Merge {branch_name} (task {task_id})"
                 proc = await asyncio.create_subprocess_exec(
-                    "git", "merge", "--no-ff", "-m",
-                    f"Merge {branch_name} (task {task_id})",
+                    "git", "merge", "--no-ff", "-m", merge_msg,
                     branch_name,
                     cwd=str(self.main_repo),
                     stdout=asyncio.subprocess.PIPE,
@@ -131,15 +147,16 @@ class WorktreeManager:
                 stdout, stderr = await proc.communicate()
 
                 if proc.returncode != 0:
-                    log.warning(f"Merge conflict for {task_id}: {stderr.decode()}")
-                    await asyncio.create_subprocess_exec(
-                        "git", "merge", "--abort",
-                        cwd=str(self.main_repo),
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
+                    log.warning(
+                        f"Merge conflict for {task_id}: {stderr.decode()}"
                     )
-                    return False
+                    merged = await self._handle_merge_conflict(
+                        branch_name, task_id, conflict_resolver,
+                    )
+                    if not merged:
+                        return False
 
+                # ── Cleanup worktree and branch ────────────────────────
                 await asyncio.create_subprocess_exec(
                     "git", "worktree", "remove", "--force", str(worktree_path),
                     cwd=str(self.main_repo),
@@ -161,6 +178,139 @@ class WorktreeManager:
             except Exception as e:
                 log.error(f"Failed to merge/cleanup worktree for {task_id}: {e}")
                 return False
+
+    # ── Conflict resolution helpers ────────────────────────────────────
+
+    async def _handle_merge_conflict(
+        self,
+        branch_name: str,
+        task_id: str,
+        conflict_resolver: ConflictResolver | None,
+    ) -> bool:
+        """Attempt to resolve a merge conflict.
+
+        Strategy:
+          1. If a *conflict_resolver* callback is provided, let it edit the
+             conflicted files in-place, then verify no markers remain.
+          2. If that fails (or no resolver), abort and retry with
+             ``-X theirs`` which prefers the task branch for every hunk.
+          3. If *that* also fails, abort and give up.
+        """
+        repo = self.main_repo
+
+        # ── Strategy 1: agent-based resolution ─────────────────────────
+        if conflict_resolver:
+            conflicted = await self._conflicted_files()
+            if conflicted:
+                log.info(
+                    f"  merge: attempting agent resolution for {task_id} "
+                    f"({len(conflicted)} files: "
+                    f"{', '.join(conflicted[:5])})"
+                )
+                try:
+                    ok = await conflict_resolver(str(repo), conflicted)
+                except Exception as exc:
+                    log.warning(f"  merge: resolver raised: {exc}")
+                    ok = False
+
+                if ok:
+                    # Verify no conflict markers leaked through
+                    still_dirty = self._files_with_markers(
+                        repo, conflicted,
+                    )
+                    if still_dirty:
+                        log.warning(
+                            f"  merge: conflict markers remain in "
+                            f"{still_dirty} — aborting agent resolution"
+                        )
+                    else:
+                        # Stage everything and finish the merge commit
+                        for f in conflicted:
+                            await asyncio.create_subprocess_exec(
+                                "git", "add", f,
+                                cwd=str(repo),
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                        proc = await asyncio.create_subprocess_exec(
+                            "git", "commit", "--no-gpg-sign",
+                            "--no-verify", "--no-edit",
+                            cwd=str(repo),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        _, stderr = await proc.communicate()
+                        if proc.returncode == 0:
+                            log.info(
+                                f"  merge: agent resolved conflicts for "
+                                f"{task_id}"
+                            )
+                            return True
+                        log.warning(
+                            f"  merge: commit after agent resolution "
+                            f"failed: {stderr.decode()}"
+                        )
+
+        # ── Abort the current (failed) merge before retrying ───────────
+        await asyncio.create_subprocess_exec(
+            "git", "merge", "--abort",
+            cwd=str(repo),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        # ── Strategy 2: re-merge preferring the task branch ───────────
+        log.info(f"  merge: retrying with -X theirs for {task_id}")
+        merge_msg = f"Merge {branch_name} (task {task_id}, auto-resolved)"
+        proc = await asyncio.create_subprocess_exec(
+            "git", "merge", "--no-ff", "-X", "theirs",
+            "-m", merge_msg, branch_name,
+            cwd=str(repo),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            log.info(f"  merge: resolved with -X theirs for {task_id}")
+            return True
+
+        log.error(
+            f"  merge: -X theirs also failed for {task_id}: "
+            f"{stderr.decode()}"
+        )
+        await asyncio.create_subprocess_exec(
+            "git", "merge", "--abort",
+            cwd=str(repo),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return False
+
+    async def _conflicted_files(self) -> list[str]:
+        """Return relative paths of files with unresolved merge conflicts."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "--diff-filter=U",
+            cwd=str(self.main_repo),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if not stdout or not stdout.strip():
+            return []
+        return stdout.decode().strip().splitlines()
+
+    @staticmethod
+    def _files_with_markers(repo: Path, paths: list[str]) -> list[str]:
+        """Return subset of *paths* that still contain conflict markers."""
+        bad: list[str] = []
+        for p in paths:
+            try:
+                content = (repo / p).read_text(errors="replace")
+                if _CONFLICT_RE.search(content):
+                    bad.append(p)
+            except OSError:
+                pass
+        return bad
 
     async def cleanup_all(self) -> None:
         """Clean up all worktrees (for shutdown)."""
