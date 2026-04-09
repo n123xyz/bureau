@@ -44,25 +44,36 @@ _BUREAU_IGNORE_LINES = ["_bureau_*", ".claude/"]
 
 
 def _ensure_bureau_gitignore(cwd: str) -> None:
-    """Ensure the .gitignore contains bureau-internal ignore patterns.
+    """Ensure the .gitignore contains all required ignore patterns.
 
-    If the user initialized the repo themselves, the .gitignore may be
-    missing or may lack the _bureau_* rule. Append what's missing.
+    Checks every non-blank, non-comment line from _GITIGNORE and appends
+    any that are missing.  This covers build artifacts (which break
+    merging) and bureau-internal files.
     """
     gitignore = Path(cwd) / ".gitignore"
     existing = ""
     if gitignore.exists():
         existing = gitignore.read_text()
 
-    missing = [line for line in _BUREAU_IGNORE_LINES
-               if line not in existing.splitlines()]
+    # No .gitignore at all (or blank) → write the full default template
+    if not existing.strip():
+        gitignore.write_text(_GITIGNORE)
+        return
+
+    # Find every pattern line from the template that's missing
+    existing_lines = set(existing.splitlines())
+    required = [
+        line for line in _GITIGNORE.splitlines()
+        if line and not line.startswith("#")
+    ]
+    missing = [line for line in required if line not in existing_lines]
     if not missing:
         return
 
-    addition = "\n# Bureau internals (auto-added)\n"
+    addition = "\n# Bureau defaults (auto-added)\n"
     addition += "\n".join(missing) + "\n"
 
-    if existing and not existing.endswith("\n"):
+    if not existing.endswith("\n"):
         addition = "\n" + addition
 
     gitignore.write_text(existing + addition)
