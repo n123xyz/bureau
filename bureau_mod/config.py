@@ -41,7 +41,7 @@ class Critic:
 class UsageCap:
     """Caps on cost/usage that trigger automatic pause."""
     max_cost_per_hour: float | None = None
-    max_utilization: float | None = None  # 0.0-1.0, from SDK RateLimitInfo
+    max_utilization: float | None = 0.8  # 0.0-1.0, from SDK RateLimitInfo
     pause_on_cap: bool = True
 
     @classmethod

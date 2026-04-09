@@ -131,13 +131,37 @@ def check_usage_cap(cfg_cap: UsageCap) -> bool:
 
 
 async def enforce_usage_cap(cfg_cap: UsageCap) -> None:
-    """Check cap and pause if exceeded."""
+    """Check cap and pause if exceeded.
+
+    Pauses work and polls every 30s.  Resumes automatically when the cap
+    is no longer exceeded (e.g. utilization drops after a quota reset) or
+    when manually un-paused via the web UI.
+    """
     if not cfg_cap.pause_on_cap:
         return
-    if check_usage_cap(cfg_cap):
-        log.warning("Usage cap exceeded — auto-pausing")
-        STATE.paused = True
-        PAUSE_EVENT.clear()
-        emit_stats()
-        # Wait until manually resumed
-        await PAUSE_EVENT.wait()
+    if not check_usage_cap(cfg_cap):
+        return
+
+    log.warning("Usage cap exceeded — pausing (will auto-resume when cap clears)")
+    STATE.paused = True
+    PAUSE_EVENT.clear()
+    emit_stats()
+
+    while True:
+        # Unblock immediately if manually resumed via web UI
+        try:
+            await asyncio.wait_for(PAUSE_EVENT.wait(), timeout=30)
+            break  # manually resumed
+        except asyncio.TimeoutError:
+            pass
+
+        if STATE.stopping:
+            raise asyncio.CancelledError("Stopping")
+
+        # Re-check the cap — utilization may have dropped
+        if not check_usage_cap(cfg_cap):
+            log.info("Usage cap no longer exceeded — auto-resuming")
+            STATE.paused = False
+            PAUSE_EVENT.set()
+            emit_stats()
+            break
