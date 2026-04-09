@@ -32,6 +32,41 @@ def git_init_if_needed(cwd: str) -> None:
             cwd=cwd, capture_output=True, timeout=30,
         )
 
+    # Even if the repo already existed, ensure _bureau_* files are ignored.
+    # Without this, _bureau_subtasks.json gets committed and propagated to
+    # worktrees, causing every child task to re-read the parent's plan and
+    # spawn duplicate subtask trees (N^depth explosion).
+    _ensure_bureau_gitignore(cwd)
+
+
+# Lines that MUST be present in .gitignore for bureau to work correctly.
+_BUREAU_IGNORE_LINES = ["_bureau_*", ".claude/"]
+
+
+def _ensure_bureau_gitignore(cwd: str) -> None:
+    """Ensure the .gitignore contains bureau-internal ignore patterns.
+
+    If the user initialized the repo themselves, the .gitignore may be
+    missing or may lack the _bureau_* rule. Append what's missing.
+    """
+    gitignore = Path(cwd) / ".gitignore"
+    existing = ""
+    if gitignore.exists():
+        existing = gitignore.read_text()
+
+    missing = [line for line in _BUREAU_IGNORE_LINES
+               if line not in existing.splitlines()]
+    if not missing:
+        return
+
+    addition = "\n# Bureau internals (auto-added)\n"
+    addition += "\n".join(missing) + "\n"
+
+    if existing and not existing.endswith("\n"):
+        addition = "\n" + addition
+
+    gitignore.write_text(existing + addition)
+
 
 # Common build/IDE artifacts to ignore across many languages
 _GITIGNORE = """\
