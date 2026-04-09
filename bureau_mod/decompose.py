@@ -201,23 +201,29 @@ def _parse_plan_items(result: Any) -> list[PlanItem]:
 def _read_subtasks_file(cwd: str) -> list[PlanItem]:
     """Read and clean up the subtasks file written by the work agent.
 
-    Returns parsed subtask list (empty if file doesn't exist or is invalid).
-    Deletes the file after reading.
+    Searches cwd and all subdirectories — agents sometimes write the file
+    inside a nested directory.  If multiple are found, their subtask lists
+    are merged.  All matching files are deleted after reading.
     """
-    path = Path(cwd) / SUBTASKS_FILE
-    if not path.exists():
+    root = Path(cwd)
+    paths = list(root.rglob(SUBTASKS_FILE))
+    if not paths:
         return []
-    try:
-        data = json.loads(path.read_text())
-        return _parse_plan_items(data)
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning(f"Failed to read {SUBTASKS_FILE}: {e}")
-        return []
-    finally:
+
+    all_items: list[PlanItem] = []
+    for path in paths:
         try:
-            path.unlink()
-        except OSError:
-            pass
+            data = json.loads(path.read_text())
+            all_items.extend(_parse_plan_items(data))
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"Failed to read {path}: {e}")
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    return all_items
 
 
 # ═══════════════════════════════════════════════════════════════════════════
