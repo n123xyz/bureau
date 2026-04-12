@@ -22,6 +22,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from bureau_mod.ollama_client import OllamaLocalClient
 from bureau_mod.config import Config
 from bureau_mod.context import extract_json
 from bureau_mod.rate_limit import (
@@ -245,6 +246,13 @@ async def run_agent(
     # Resolve model/effort/thinking for this phase+task_type
     model, effort, thinking = cfg.resolve(phase_name, task_type)
 
+    env = {}
+    actual_model = model
+    if model and model.startswith("ollama/"):
+        actual_model = model[len("ollama/"):]
+        env["ANTHROPIC_BASE_URL"] = cfg.ollama_base_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+
     # Record on the task node
     if task_id:
         task = STATE.get_task(task_id)
@@ -257,6 +265,65 @@ async def run_agent(
                 task.prompt = prompt
             emit_event("task", task.to_dict())
 
+    is_ollama = model and (model.startswith("ollama/") or not model.startswith("claude-"))
+    if is_ollama:
+        actual_model = model[len("ollama/"):] if model.startswith("ollama/") else model
+        env["ANTHROPIC_BASE_URL"] = cfg.ollama_base_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+        for attempt in range(max_retries):
+            sem = state_mod.AGENT_SEMAPHORE
+            assert sem is not None, "AGENT_SEMAPHORE not initialized"
+            async with sem:
+                await PAUSE_EVENT.wait()
+                if STATE.stopping:
+                    raise asyncio.CancelledError("Stopping")
+                
+                log.info(f"  [{label}] agent #{agent_num} starting (ollama:{actual_model}) attempt {attempt+1}")
+                if task_id:
+                    emit_task_output(task_id, f"ollama agent #{agent_num} starting ({actual_model})")
+                
+                opts = ClaudeAgentOptions(
+                    model=actual_model,
+                    effort=effort,
+                    env=env,
+                    permission_mode=cfg.permission_mode,
+                    cwd=cwd,
+                    setting_sources=cfg.setting_sources,
+                    thinking=cfg.thinking_config(thinking),
+                )
+                if system_prompt:
+                    opts.system_prompt = system_prompt
+                
+                client = OllamaLocalClient(opts, allow_network=cfg.allow_network)
+                if task_id:
+                    ACTIVE_CLIENTS[task_id] = client
+
+                t0 = time.monotonic()
+                try:
+                    await client.connect()
+                    await client.query(prompt)
+                    result, text = await drain_response(
+                        client, cfg.timeout, cfg.stall_timeout, label,
+                        task_id=task_id,
+                    )
+
+                    elapsed = time.monotonic() - t0
+                    log.info(f"  [{label}] done {elapsed:.1f}s")
+                    if task_id:
+                        emit_task_output(task_id, f"done {elapsed:.1f}s")
+                    return text
+                except Exception as e:
+                    log.error(f"  [{label}] ollama failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5 * (attempt + 1))
+                        continue
+                    return ""
+                finally:
+                    if task_id:
+                        ACTIVE_CLIENTS.pop(task_id, None)
+                    await client.disconnect()
+        return ""
+
     for attempt in range(max_retries):
         sem = state_mod.AGENT_SEMAPHORE
         assert sem is not None, "AGENT_SEMAPHORE not initialized"
@@ -266,8 +333,9 @@ async def run_agent(
                 raise asyncio.CancelledError("Stopping")
 
             opts = ClaudeAgentOptions(
-                model=model,
+                model=actual_model,
                 effort=effort,
+                env=env,
                 permission_mode=cfg.permission_mode,
                 cwd=cwd,
                 setting_sources=cfg.setting_sources,
@@ -381,6 +449,13 @@ async def run_structured_agent(
 
     model, effort, thinking = cfg.resolve(phase_name, task_type)
 
+    env = {}
+    actual_model = model
+    if model and model.startswith("ollama/"):
+        actual_model = model[len("ollama/"):]
+        env["ANTHROPIC_BASE_URL"] = cfg.ollama_base_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+
     if task_id:
         task = STATE.get_task(task_id)
         if task:
@@ -392,6 +467,82 @@ async def run_structured_agent(
                 task.prompt = prompt
             emit_event("task", task.to_dict())
 
+    is_ollama = model and (model.startswith("ollama/") or not model.startswith("claude-"))
+    if is_ollama:
+        actual_model = model[len("ollama/"):] if model.startswith("ollama/") else model
+        env["ANTHROPIC_BASE_URL"] = cfg.ollama_base_url
+        env["ANTHROPIC_AUTH_TOKEN"] = "ollama"
+        for attempt in range(max_retries):
+            sem = state_mod.AGENT_SEMAPHORE
+            assert sem is not None, "AGENT_SEMAPHORE not initialized"
+            async with sem:
+                await PAUSE_EVENT.wait()
+                if STATE.stopping:
+                    raise asyncio.CancelledError("Stopping")
+                
+                log.info(f"  [{label}] structured agent #{agent_num} starting (ollama:{actual_model}) attempt {attempt+1}")
+                if task_id:
+                    emit_task_output(task_id, f"ollama structured agent #{agent_num} starting ({actual_model})")
+                
+                opts = ClaudeAgentOptions(
+                    model=actual_model,
+                    effort=effort,
+                    env=env,
+                    permission_mode=cfg.permission_mode,
+                    cwd=cwd,
+                    setting_sources=cfg.setting_sources,
+                    thinking=cfg.thinking_config(thinking),
+                    output_format={"type": "json_schema", "schema": schema},
+                )
+                if system_prompt:
+                    opts.system_prompt = system_prompt
+                
+                client = OllamaLocalClient(opts, allow_network=cfg.allow_network)
+                if task_id:
+                    ACTIVE_CLIENTS[task_id] = client
+
+                t0 = time.monotonic()
+                try:
+                    await client.connect()
+                    await client.query(prompt)
+                    result, text = await drain_response(
+                        client, cfg.timeout, cfg.stall_timeout, label,
+                        task_id=task_id,
+                    )
+                    
+                    elapsed = time.monotonic() - t0
+                    log.info(f"  [{label}] done {elapsed:.1f}s")
+                    
+                    if result and result.structured_output is not None:
+                        output = result.structured_output
+                        if isinstance(output, str):
+                            try:
+                                output = json.loads(output)
+                            except Exception:
+                                pass
+                        if task_id and isinstance(output, dict):
+                            _emit_structured_summary(task_id, output)
+                        return output
+                    else:
+                        try:
+                            output = json.loads(text)
+                        except Exception:
+                            output = extract_json(text)
+                        if task_id and isinstance(output, dict):
+                            _emit_structured_summary(task_id, output)
+                        return output
+                except Exception as e:
+                    log.error(f"  [{label}] ollama failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5 * (attempt + 1))
+                        continue
+                    return None
+                finally:
+                    if task_id:
+                        ACTIVE_CLIENTS.pop(task_id, None)
+                    await client.disconnect()
+        return None
+
     for attempt in range(max_retries):
         sem = state_mod.AGENT_SEMAPHORE
         assert sem is not None, "AGENT_SEMAPHORE not initialized"
@@ -401,8 +552,9 @@ async def run_structured_agent(
                 raise asyncio.CancelledError("Stopping")
 
             opts = ClaudeAgentOptions(
-                model=model,
+                model=actual_model,
                 effort=effort,
+                env=env,
                 permission_mode=cfg.permission_mode,
                 cwd=cwd,
                 setting_sources=cfg.setting_sources,

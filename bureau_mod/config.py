@@ -70,6 +70,8 @@ class Config:
     work_budget: int = 2000
     use_worktrees: bool = True
     web_port: int = 8765
+    ollama_base_url: str = "http://localhost:11434"
+    allow_network: bool = False
     setting_sources: list[str] = field(
         default_factory=lambda: ["user", "project", "local"]
     )
@@ -96,7 +98,7 @@ class Config:
                        "max_revision_rounds", "max_split_pieces", "timeout",
                        "stall_timeout", "permission_mode",
                        "parallel_subtasks", "max_parallel", "use_worktrees",
-                       "web_port", "setting_sources", "work_budget"):
+                       "web_port", "setting_sources", "work_budget", "ollama_base_url", "allow_network"):
                 if k in raw:
                     setattr(cfg, k, raw[k])
 

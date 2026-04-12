@@ -9,7 +9,7 @@ It's for building a thing from scratch, when the thing is somewhat too
 big to just "one shot" it.
 
 So: it runs a bunch of agents, using whatever your API or subscription
-is. It only works on anthropic/claude currently. Pull requests
+is. It works on anthropic/claude and ollama currently. Pull requests
 welcome.
 
 You give it a config dir with a file (problem.md) and a bunch of

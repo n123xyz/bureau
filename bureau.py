@@ -1,8 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["claude-agent-sdk", "aiohttp"]
-# ///
+#!/usr/bin/env python3
 """
 Bureau: Hierarchical multi-phase agent orchestrator for software development (v3).
 

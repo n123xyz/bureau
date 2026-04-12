@@ -216,8 +216,14 @@ async def handle_sse(request: web.Request) -> web.StreamResponse:
                 await resp.write(f"data: {payload}\n\n".encode())
             except asyncio.TimeoutError:
                 # Send keepalive
-                await resp.write(b": keepalive\n\n")
-            except (ConnectionResetError, ConnectionError):
+                try:
+                    await resp.write(b": keepalive\n\n")
+                except (ConnectionError, ConnectionResetError, aiohttp.ClientConnectionResetError):
+                    break
+            except (ConnectionError, ConnectionResetError, aiohttp.ClientConnectionResetError):
+                break
+            except Exception as e:
+                log.error(f"SSE error: {e}")
                 break
     finally:
         SSE_CLIENTS.discard(q)
@@ -694,7 +700,7 @@ function renderTaskNode(taskId, depth) {
   const lastLine = nLines > 0 ? t.output_lines[nLines - 1] : '';
   const wt = t.worktree_path ? '⎇wt' : '⎇main';
   const wtClass = t.worktree_path ? 'task-wt' : 'task-model';
-  const modelStr = t.model ? t.model.replace('claude-', '').substring(0, 15) : '';
+  const modelStr = t.model ? (t.model.startsWith('ollama/') ? t.model.replace('ollama/', '') : t.model.replace('claude-', '')).substring(0, 15) : '';
   const effortStr = t.effort || '';
   const thinkStr = t.thinking || '';
   const configStr = [modelStr, effortStr, thinkStr].filter(Boolean).join('/');

@@ -1,0 +1,5 @@
+example-cfg/problem.md
+.venv
+bureau_mod/__pycache__
+example-cfg/checkpoint.json
+example-cfg/logs/
