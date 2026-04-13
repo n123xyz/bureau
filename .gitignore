@@ -3,3 +3,4 @@ example-cfg/problem.md
 bureau_mod/__pycache__
 example-cfg/checkpoint.json
 example-cfg/logs/
+__pycache__

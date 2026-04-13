@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 
+import aiohttp
 from aiohttp import web
 
 from bureau_mod.git_utils import git_log_oneline, git_ls_tree, git_show_diff, read_repo_file
@@ -162,6 +163,15 @@ async def handle_api_task_prompt(request: web.Request) -> web.Response:
     return web.json_response({"task_id": task_id, "prompt": task.prompt or ""})
 
 
+async def handle_api_task_text(request: web.Request) -> web.Response:
+    """Return the accumulated text output for a task."""
+    task_id = request.query.get("task_id", "")
+    task = STATE.get_task(task_id)
+    if not task:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"task_id": task_id, "text": task.agent_text or ""})
+
+
 async def handle_api_filetree(request: web.Request) -> web.Response:
     """Return file tree of current HEAD."""
     files = git_ls_tree(STATE.work_dir)
@@ -244,6 +254,7 @@ async def start_web_server(port: int) -> web.AppRunner:
     app.router.add_get("/api/gitdiff", handle_api_gitdiff)
     app.router.add_get("/api/task_output", handle_api_task_output)
     app.router.add_get("/api/task_prompt", handle_api_task_prompt)
+    app.router.add_get("/api/task_text", handle_api_task_text)
     app.router.add_get("/api/filetree", handle_api_filetree)
     app.router.add_get("/api/file", handle_api_file)
     app.router.add_post("/api/skip", handle_api_skip)
@@ -456,6 +467,7 @@ let fileTree = [];
 let expandedTasks = new Set();
 let expandedOutputs = new Set();
 let expandedPrompts = {};
+let expandedText = {};
 let expandedDiffs = {};
 let renderRAF = null;
 let previewTimer = null;
@@ -484,6 +496,22 @@ function connectSSE() {
       case 'gitlog': gitLog = msg.data; renderGit(); break;
       case 'phase': updatePhase(msg.data.name); break;
       case 'rate_limit': updateRateLimit(msg.data); break;
+      case 'stream':
+        if(S.tasks[msg.data.task_id]) {
+          const firstTime = !S.tasks[msg.data.task_id].has_agent_text;
+          S.tasks[msg.data.task_id].has_agent_text = true;
+          if(firstTime) scheduleRender();
+
+          if(expandedText[msg.data.task_id] && expandedText[msg.data.task_id] !== true) {
+            expandedText[msg.data.task_id] += msg.data.chunk;
+            const el = document.getElementById('text-' + msg.data.task_id);
+            if(el) {
+              el.appendChild(document.createTextNode(msg.data.chunk));
+              el.scrollTop = el.scrollHeight;
+            }
+          }
+        }
+        break;
     }
   };
 
@@ -669,7 +697,7 @@ function cancelPreview() {
 // ── Task rendering ─────────────────────────────────────────────────────
 function renderTasks() {
   const el = document.getElementById('task-tree');
-  // Save scroll positions of open prompt/output containers before rebuild
+  // Save scroll positions of open prompt/output/text containers before rebuild
   const savedScrolls = {};
   el.querySelectorAll('.task-prompt, .task-output').forEach(c => {
     if (c.id && c.scrollTop > 0) savedScrolls[c.id] = c.scrollTop;
@@ -759,11 +787,23 @@ function renderTaskNode(taskId, depth) {
       }
     }
 
+    let textHtml = '';
+    if (t.has_agent_text) {
+      const isTextOpen = expandedText[t.id];
+      if (isTextOpen) {
+        textHtml = `<div style="margin-top:4px"><span class="btn-sm" onclick="event.stopPropagation();toggleText('${t.id}')">▾ Agent Output</span></div>` +
+          `<div class="task-prompt" id="text-${t.id}">${expandedText[t.id] === true ? 'Loading...' : esc(expandedText[t.id])}</div>`;
+      } else {
+        textHtml = `<div style="margin-top:4px"><span class="btn-sm" onclick="event.stopPropagation();toggleText('${t.id}')">▸ Agent Output</span></div>`;
+      }
+    }
+
     detail = `<div class="task-detail open">
       <div class="task-desc">${esc(desc)}</div>
       ${depsLine}${err}
       ${outputHtml}
       ${promptHtml}
+      ${textHtml}
     </div>`;
   } else {
     // Collapsed: first 80 chars of description + last output line
@@ -824,6 +864,24 @@ async function togglePrompt(taskId) {
     expandedPrompts[taskId] = data.prompt || '(no prompt stored)';
   } catch(e) {
     expandedPrompts[taskId] = '(error loading prompt)';
+  }
+  renderTasks();
+}
+
+async function toggleText(taskId) {
+  if (expandedText[taskId]) {
+    delete expandedText[taskId];
+    renderTasks();
+    return;
+  }
+  expandedText[taskId] = true; // loading state
+  renderTasks();
+  try {
+    const res = await fetch('/api/task_text?task_id=' + encodeURIComponent(taskId));
+    const data = await res.json();
+    expandedText[taskId] = data.text || '(no text stored)';
+  } catch(e) {
+    expandedText[taskId] = '(error loading text)';
   }
   renderTasks();
 }

@@ -1,0 +1,21 @@
+{
+    "mcpServers": {
+        "weather": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "../../ollama-mcp-bridge/mock-weather-mcp-server",
+                "run",
+                "--python",
+                "3.12",
+                "main.py"
+            ],
+            "toolFilter": {
+                "tools": [
+                    "get_current_temperature",
+                    "get_forecast"
+                ]
+            }
+        }
+    }
+}

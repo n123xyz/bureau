@@ -32,7 +32,14 @@ class LinuxSandbox:
         self.readable_roots = readable_roots or ["/bin", "/sbin", "/usr", "/etc", "/lib", "/lib64"]
         self.writable_roots = writable_roots or [self.workspace_dir]
         self.read_only_subpaths = read_only_subpaths or [os.path.join(self.workspace_dir, ".git")]
-        self.unreadable_paths = unreadable_paths or []
+        self.unreadable_paths = unreadable_paths or [
+            "/usr/bin/python",
+            "/usr/bin/python3",
+            "/bin/python",
+            "/bin/python3",
+            "/usr/local/bin/python",
+            "/usr/local/bin/python3"
+        ]
 
     def execute(self, command: str, allow_network: bool = False):
         try:
@@ -61,7 +68,10 @@ class LinuxSandbox:
             # Apply complete unreadable masking first
             for unreadable in set(self.unreadable_paths):
                 # Ensure the parent exists in BWrap before trying to mount tmpfs over it
-                bwrap_args.extend(["--perms", "000", "--tmpfs", unreadable])
+                if os.path.isdir(unreadable):
+                    bwrap_args.extend(["--perms", "000", "--tmpfs", unreadable])
+                else:
+                    bwrap_args.extend(["--ro-bind", "/bin/false", unreadable])
 
             # Layer explicit writable roots
             for writable in set(self.writable_roots):
@@ -186,10 +196,54 @@ class OllamaLocalClient:
         self._task = None
         
     async def connect(self):
-        pass
+        from bureau_mod.state import STATE
+        config_path = os.path.join(STATE.config_dir, "mcp-config.json")
+        if os.path.exists(config_path):
+            try:
+                from ollama_mcp_bridge.mcp_manager import MCPManager
+                base_url = "http://localhost:11434"
+                if hasattr(self.client, "_client") and hasattr(self.client._client, "_base_url"):
+                    base_url = str(self.client._client._base_url)
+                self.mcp_manager = MCPManager(ollama_url=base_url)
+                await self.mcp_manager.load_servers(config_path)
+                self.mcp_tools = self.mcp_manager.all_tools
+                if self.mcp_tools:
+                    self.tools.extend(self.mcp_tools)
+                    tool_desc_lines = []
+                    for t in self.mcp_tools:
+                        fn = t.get("function", {})
+                        name = fn.get("name", "Unknown")
+                        desc = fn.get("description", "No description provided")
+                        params = fn.get("parameters", {})
+                        props = params.get("properties", {})
+                        if props:
+                            param_parts = []
+                            for pname, pschema in props.items():
+                                ptype = pschema.get("type", "any")
+                                pdesc = pschema.get("description", "")
+                                param_parts.append(f"    - {pname} ({ptype}): {pdesc}")
+                            param_str = "\n".join(param_parts)
+                            tool_desc_lines.append(f"- **{name}**: {desc}\n  Parameters:\n{param_str}")
+                        else:
+                            tool_desc_lines.append(f"- **{name}**: {desc}")
+                    
+                    if tool_desc_lines:
+                        self.mcp_doc = (
+                            "\n\n---\n## Available MCP Tools\n"
+                            "The following external tools are available to you via tool calls. "
+                            "You can invoke them just like the built-in tools (bash, read, write, etc.).\n\n"
+                            + "\n".join(tool_desc_lines)
+                        )
+            except Exception as e:
+                import logging
+                logging.getLogger("bureau").warning(f"Failed to initialize MCP servers: {e}")
 
     async def disconnect(self):
-        pass
+        if hasattr(self, 'mcp_manager'):
+            try:
+                await self.mcp_manager.cleanup()
+            except Exception:
+                pass
 
     async def interrupt(self):
         self._running = False
@@ -275,7 +329,15 @@ class OllamaLocalClient:
                 if content:
                     assistant_msg["content"] = content
                 if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            }
+                        }
+                        for tc in tool_calls
+                    ]
                 if not content and not tool_calls:
                     # prevent API error for empty model turn 
                     assistant_msg["content"] = "ok" 
@@ -315,7 +377,9 @@ class OllamaLocalClient:
                     
                     # Ensure safe local execution
                     try:
-                        if name == "bash":
+                        if hasattr(self, 'mcp_tools') and any(t.get("function", {}).get("name") == name for t in self.mcp_tools):
+                            result_str = await self.mcp_manager.call_tool(name, args)
+                        elif name == "bash":
                             # Route bash command through the sandbox
                             result_str = self.sandbox.execute(
                                 command=args.get("command", ""),
@@ -360,5 +424,9 @@ class OllamaLocalClient:
             ))
             
         finally:
-            os.chdir(original_cwd)
+            try:
+                os.chdir(original_cwd)
+            except OSError:
+                pass
+            self._running = False
             await self._queue.put(None)

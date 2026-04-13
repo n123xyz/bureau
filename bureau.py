@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["claude-agent-sdk", "aiohttp", "ollama", "ollama-mcp-bridge>=0.11.2"]
+# ///
 """
 Bureau: Hierarchical multi-phase agent orchestrator for software development (v3).
 

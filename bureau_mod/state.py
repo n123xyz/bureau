@@ -58,6 +58,8 @@ class TaskNode:
     output_lines: list[str] = field(default_factory=list)
     # Full prompt (stored for UI inspection, not broadcast via SSE)
     prompt: str = ""
+    # Agent generated text
+    agent_text: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +85,7 @@ class TaskNode:
             "stop_revising": self.stop_revising,
             "output_lines": self.output_lines[-200:],  # cap for serialization
             "has_prompt": bool(self.prompt),
+            "has_agent_text": bool(self.agent_text),
         }
 
 
@@ -204,6 +207,7 @@ class BureauState:
                 file_reads=td.get("file_reads", []),
                 file_writes=td.get("file_writes", []),
                 concurrency_group=td.get("concurrency_group"),
+                agent_text=td.get("agent_text", ""),
             )
             state.tasks[task_id] = task
         state.root_task_ids = data.get("root_task_ids", [])
@@ -302,3 +306,11 @@ def emit_stats() -> None:
         "paused": STATE.paused,
         "current_phase": STATE.current_phase,
     })
+
+
+def emit_agent_stream(task_id: str, chunk: str) -> None:
+    """Append a text chunk to the agent's output and broadcast it."""
+    task = STATE.get_task(task_id)
+    if task:
+        task.agent_text += chunk
+    emit_event("stream", {"task_id": task_id, "chunk": chunk})

@@ -40,6 +40,7 @@ from bureau_mod.state import (
     emit_event,
     emit_stats,
     emit_task_output,
+    emit_agent_stream,
 )
 
 log = logging.getLogger("bureau")
@@ -148,12 +149,16 @@ async def drain_response(
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             text_parts.append(block.text)
+                            if task_id:
+                                emit_agent_stream(task_id, block.text)
                             if not quiet:
                                 print(".", end="", flush=True)
                         elif isinstance(block, ThinkingBlock):
                             log.info(f"    [{label}] (thinking...)")
                             if task_id:
                                 emit_task_output(task_id, "(thinking...)")
+                                if hasattr(block, 'thinking') and block.thinking:
+                                    emit_agent_stream(task_id, block.thinking)
                         elif isinstance(block, ToolUseBlock):
                             tool_count += 1
                             summary = _summarize_tool_input(block.name, block.input)
@@ -162,6 +167,11 @@ async def drain_response(
                             log.info(f"    [{label}] {line}")
                             if task_id:
                                 emit_task_output(task_id, line)
+                                try:
+                                    t_json = json.dumps(block.input, indent=2)
+                                    emit_agent_stream(task_id, f"\n[Tool: {block.name}]\n{t_json}\n")
+                                except Exception:
+                                    emit_agent_stream(task_id, f"\n[Tool: {block.name}]\n{block.input}\n")
                         elif isinstance(block, ToolResultBlock):
                             if block.is_error:
                                 err_line = f"tool error: {str(block.content)[:200]}"
@@ -301,6 +311,14 @@ async def run_agent(
                 t0 = time.monotonic()
                 try:
                     await client.connect()
+                    # Inject MCP tool documentation into the prompt
+                    if hasattr(client, 'mcp_doc') and client.mcp_doc:
+                        prompt += client.mcp_doc
+                        if task_id:
+                            task = STATE.get_task(task_id)
+                            if task:
+                                task.prompt = prompt
+                                emit_event("task", task.to_dict())
                     await client.query(prompt)
                     result, text = await drain_response(
                         client, cfg.timeout, cfg.stall_timeout, label,
