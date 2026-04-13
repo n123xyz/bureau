@@ -80,6 +80,18 @@ class WorktreeManager:
                     )
 
                 self.active_worktrees[task_id] = worktree_path
+                
+                # Symlink the main repo's .venv to the worktree to avoid re-syncing over network
+                main_venv = self.main_repo / ".venv"
+                if main_venv.exists():
+                    try:
+                        worktree_venv = worktree_path / ".venv"
+                        if not worktree_venv.exists():
+                            worktree_venv.symlink_to(main_venv, target_is_directory=True)
+                            log.debug(f"Symlinked .venv from {main_venv} to {worktree_path}")
+                    except Exception as ve:
+                        log.warning(f"Failed to symlink .venv to worktree: {ve}")
+
                 log.debug(f"Created worktree for {task_id}: {worktree_path}")
                 return worktree_path
 

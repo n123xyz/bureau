@@ -95,9 +95,14 @@ def _summarize_tool_input(name: str, inp: dict[str, Any]) -> str:
     if name == "StructuredOutput":
         # Full content emitted separately via _emit_structured_summary
         return ""
+    # MCP tools (dotted names like server.tool_name) or other unknown tools
     for v in inp.values():
         if isinstance(v, str) and v:
             return v[:80]
+    # Fallback: show all arg keys=values compactly
+    if inp:
+        parts = [f"{k}={str(v)[:40]}" for k, v in inp.items()]
+        return ", ".join(parts)[:120]
     return ""
 
 
@@ -173,11 +178,16 @@ async def drain_response(
                                 except Exception:
                                     emit_agent_stream(task_id, f"\n[Tool: {block.name}]\n{block.input}\n")
                         elif isinstance(block, ToolResultBlock):
+                            result_preview = str(block.content)[:200]
                             if block.is_error:
-                                err_line = f"tool error: {str(block.content)[:200]}"
+                                err_line = f"tool error: {result_preview}"
                                 log.warning(f"    [{label}] {err_line}")
                                 if task_id:
                                     emit_task_output(task_id, err_line)
+                                    emit_agent_stream(task_id, f"\n[Tool Error]\n{result_preview}\n")
+                            else:
+                                if task_id:
+                                    emit_agent_stream(task_id, f"\n[Tool Result]\n{result_preview}\n")
 
                 elif isinstance(msg, SystemMessage):
                     log.debug(f"    [{label}] system: {msg.subtype}")

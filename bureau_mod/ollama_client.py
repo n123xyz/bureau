@@ -29,17 +29,61 @@ class LinuxSandbox:
     ):
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.full_disk_read = full_disk_read
-        self.readable_roots = readable_roots or ["/bin", "/sbin", "/usr", "/etc", "/lib", "/lib64"]
-        self.writable_roots = writable_roots or [self.workspace_dir]
-        self.read_only_subpaths = read_only_subpaths or [os.path.join(self.workspace_dir, ".git")]
-        self.unreadable_paths = unreadable_paths or [
-            "/usr/bin/python",
-            "/usr/bin/python3",
-            "/bin/python",
-            "/bin/python3",
-            "/usr/local/bin/python",
-            "/usr/local/bin/python3"
+
+        uv_cache = os.path.expanduser("~/.cache/uv")
+        uv_toolchains = os.path.expanduser("~/.local/share/uv")
+        self.readable_roots = readable_roots or [
+            "/bin", "/sbin", "/usr", "/etc", "/lib", "/lib64",
+            "/home/user/.local/bin",
+            uv_cache,
+            uv_toolchains,  # uv-managed Python interpreters live here
         ]
+        
+        # Ensure the workspace .venv is readable (may be a symlink to the main repo's .venv)
+        venv_path = os.path.join(self.workspace_dir, ".venv")
+        if os.path.islink(venv_path):
+            # Follow the symlink so we also mount the real .venv directory
+            real_venv = os.path.realpath(venv_path)
+            if real_venv not in self.readable_roots:
+                self.readable_roots.append(real_venv)
+        elif os.path.isdir(venv_path) and venv_path not in self.readable_roots:
+            self.readable_roots.append(venv_path)
+
+        self.writable_roots = writable_roots or [self.workspace_dir, uv_cache]
+        self.read_only_subpaths = read_only_subpaths or [os.path.join(self.workspace_dir, ".git")]
+        self.unreadable_paths = unreadable_paths or []
+        self._probe_bwrap()
+
+    def _probe_bwrap(self):
+        """Probe whether bwrap can create sandboxed namespaces on this system.
+        
+        Raises RuntimeError if bwrap is missing or cannot create user namespaces.
+        """
+        import logging
+        log = logging.getLogger("bureau.sandbox")
+        try:
+            probe = subprocess.run(
+                ["bwrap", "--unshare-user", "--unshare-pid",
+                 "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+                 "--", "true"],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0:
+                log.info("bwrap sandbox probe succeeded")
+                return
+            stderr = probe.stderr.strip()
+            if "uid map" in stderr.lower() or "permission denied" in stderr.lower():
+                raise RuntimeError(
+                    "bwrap cannot create user namespaces — likely blocked by AppArmor "
+                    "(Ubuntu 24.04+).\n"
+                    "  Fix: sudo bash scripts/fix-apparmor-bwrap.sh\n"
+                    f"  bwrap stderr: {stderr}"
+                )
+            raise RuntimeError(f"bwrap probe failed: {stderr}")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "bwrap (bubblewrap) not found. Install: sudo apt install bubblewrap"
+            )
 
     def execute(self, command: str, allow_network: bool = False):
         try:
@@ -100,7 +144,7 @@ class LinuxSandbox:
         except subprocess.TimeoutExpired:
             return "Error: Command timed out after 120s"
         except FileNotFoundError:
-            # Fallback if bwrap isn't directly available (e.g., testing locally without it)
+            # Fallback if bwrap binary disappeared after probe
             result = subprocess.run(command, shell=True, cwd=self.workspace_dir, capture_output=True, text=True, timeout=120)
             return result.stdout + result.stderr
 
